@@ -89,8 +89,16 @@ exports.handler = async (event) => {
 
     // ⚠️ list.json은 corp_code 없이 조회할 때 검색기간이 3개월로 제한됨
     // 그래서 "이번달"을 기준으로 과거 90일~월말까지로 잡음. :contentReference[oaicite:2]{index=2}
-    const listStart = addDaysUTC(start, -90);
-    const listStartYmd = `${listStart.getUTCFullYear()}${pad2(listStart.getUTCMonth() + 1)}${pad2(listStart.getUTCDate())}`;
+// list.json은 corp_code 없이 조회 시 검색기간이 3개월 이내여야 함
+// 그래서 "대상 월 포함 + 직전 2개월" (총 3개월)로 고정
+const yNum = Number(year);
+const mNum = Number(month);
+
+// month는 1~12, Date.UTC는 monthIndex(0~11)
+// mNum-3 -> 대상월의 "두 달 전" 1일 (예: 2026-02면 2025-12-01)
+const listStartDate = new Date(Date.UTC(yNum, mNum - 3, 1));
+const listStartYmd = `${listStartDate.getUTCFullYear()}${pad2(listStartDate.getUTCMonth() + 1)}01`;
+
 
     // 1) 공시검색(list): 발행공시(C) + 증권신고(지분증권)(C001) :contentReference[oaicite:3]{index=3}
     // - corp_cls=E(기타법인)로 걸면 “상장사 유상증자”가 많이 빠져서 IPO에 좀 더 가까워짐
@@ -219,3 +227,4 @@ exports.handler = async (event) => {
     return { statusCode: 500, body: JSON.stringify({ ok: false, error: String(e) }) };
   }
 };
+
