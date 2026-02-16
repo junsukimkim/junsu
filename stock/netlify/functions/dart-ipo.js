@@ -1,26 +1,26 @@
 // stock/netlify/functions/dart-ipo.js
-// 목적: DART 청약달력(지분증권)에서 월간 청약을 가져오되,
-//      KIND(거래소) 상장법인목록을 이용해 "이미 상장된 회사(유상증자 등)"를 최대한 제외.
+// DART 청약달력(지분증권) -> 월간 일정 파싱
+// KIND 상장법인목록(다운로드) -> 상장사(=유상증자 등) 최대한 제거
+//
+// 핵심 수정: KIND 파일은 EUC-KR/CP949 인코딩이라 "buffer로 받고" TextDecoder('euc-kr')로 디코딩해야 매칭됨.
 
 const https = require("https");
 const http = require("http");
+const { TextDecoder } = require("util");
 
 const DART_CAL_URL = "https://dart.fss.or.kr/dsac008/main.do";
-const KIND_LIST_URL = "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13";
+// searchType 없이 전체 다운로드 시도 (KOSPI/KOSDAQ/KONEX 포함 가능성이 높음)
+const KIND_LIST_URL = "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download";
 
-// ---- simple in-memory cache (works on warm lambda) ----
-let LISTED_CACHE = {
-  ts: 0,
-  set: null,
-};
+let LISTED_CACHE = { ts: 0, set: null };
 const LISTED_TTL_MS = 12 * 60 * 60 * 1000; // 12h
 
 function pad2(n) {
-  const x = String(n);
-  return x.length === 1 ? "0" + x : x;
+  const s = String(n);
+  return s.length === 1 ? "0" + s : s;
 }
 
-function safeJson(statusCode, obj) {
+function safeJson(obj, statusCode = 200) {
   return {
     statusCode,
     headers: {
@@ -32,7 +32,7 @@ function safeJson(statusCode, obj) {
   };
 }
 
-function requestText(url, { method = "GET", headers = {}, body = null, timeoutMs = 12000, maxRedirects = 3 } = {}) {
+function requestBuffer(url, { method = "GET", headers = {}, body = null, timeoutMs = 12000, maxRedirects = 3 } = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const lib = u.protocol === "https:" ? https : http;
@@ -53,34 +53,45 @@ function requestText(url, { method = "GET", headers = {}, body = null, timeoutMs
       (res) => {
         const status = res.statusCode || 0;
 
-        // handle redirects
-        if (
-          status >= 300 &&
-          status < 400 &&
-          res.headers.location &&
-          maxRedirects > 0
-        ) {
+        // redirects
+        if (status >= 300 && status < 400 && res.headers.location && maxRedirects > 0) {
           const next = new URL(res.headers.location, url).toString();
           res.resume();
-          requestText(next, { method, headers, body, timeoutMs, maxRedirects: maxRedirects - 1 })
+          requestBuffer(next, { method, headers, body, timeoutMs, maxRedirects: maxRedirects - 1 })
             .then(resolve)
             .catch(reject);
           return;
         }
 
-        let data = "";
-        res.setEncoding("utf8");
-        res.on("data", (chunk) => (data += chunk));
-        res.on("end", () => resolve({ status, headers: res.headers, text: data }));
+        const chunks = [];
+        res.on("data", (d) => chunks.push(d));
+        res.on("end", () => resolve({ status, headers: res.headers, buf: Buffer.concat(chunks) }));
       }
     );
 
     req.on("error", reject);
     req.setTimeout(timeoutMs, () => req.destroy(new Error("timeout")));
-
     if (body) req.write(body);
     req.end();
   });
+}
+
+function requestTextUtf8(url, opts) {
+  return requestBuffer(url, opts).then((r) => ({
+    status: r.status,
+    headers: r.headers,
+    text: r.buf.toString("utf8"),
+  }));
+}
+
+function decodeKIND(buf) {
+  // KIND 다운로드는 보통 euc-kr/cp949 계열
+  try {
+    return new TextDecoder("euc-kr").decode(buf);
+  } catch {
+    // 혹시 런타임에서 euc-kr 미지원이면 일단 utf8로라도
+    return buf.toString("utf8");
+  }
 }
 
 function decodeEntities(s) {
@@ -97,21 +108,13 @@ function htmlToLines(html) {
   if (!html) return [];
   let x = html;
 
-  // remove scripts/styles
   x = x.replace(/<script[\s\S]*?<\/script>/gi, " ");
   x = x.replace(/<style[\s\S]*?<\/style>/gi, " ");
-
-  // add newlines on common block breaks
   x = x.replace(/<br\s*\/?>/gi, "\n");
   x = x.replace(/<\/(tr|td|th|div|p|li|h1|h2|h3|h4|h5|h6)>/gi, "\n");
-
-  // strip all tags -> newline
   x = x.replace(/<[^>]+>/g, "\n");
-
-  // decode entities
   x = decodeEntities(x);
 
-  // normalize
   return x
     .split(/\r?\n/)
     .map((l) => l.trim())
@@ -128,7 +131,6 @@ function cleanCorpName(name) {
 }
 
 function normName(name) {
-  // 비교용: 공백/특수문자/중점 등 제거
   return cleanCorpName(name)
     .replace(/\s+/g, "")
     .replace(/[·•ㆍ\.\,\(\)\[\]\{\}\-_/\\'"“”‘’]/g, "")
@@ -156,8 +158,7 @@ function parseDartCalendar(lines, year, month) {
     const iso = `${year}-${pad2(month)}-${pad2(day)}`;
 
     const cur =
-      map.get(key) ||
-      {
+      map.get(key) || {
         corp_name,
         market_short: marketShort,
         market: marketFromShort(marketShort),
@@ -165,7 +166,6 @@ function parseDartCalendar(lines, year, month) {
         sbd_end: null,
       };
 
-    // keep latest clean name
     cur.corp_name = corp_name || cur.corp_name;
     cur.market_short = cur.market_short || marketShort;
     cur.market = marketFromShort(cur.market_short);
@@ -176,17 +176,13 @@ function parseDartCalendar(lines, year, month) {
     map.set(key, cur);
   }
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    // day marker: 1~31 or 01~31
+  for (const line of lines) {
     if (/^\d{1,2}$/.test(line)) {
       const n = parseInt(line, 10);
       if (n >= 1 && n <= 31) day = n;
       continue;
     }
 
-    // format A: "코 아이씨에이치 [시작]"
     let m = line.match(/^([유코넥기])\s+(.+?)\s*\[(시작|종료)\]$/);
     if (m) {
       setEvent(m[2], m[1], m[3]);
@@ -194,7 +190,6 @@ function parseDartCalendar(lines, year, month) {
       continue;
     }
 
-    // format B: market on its own line ("코"), then "아이씨에이치 [시작]"
     if (/^[유코넥기]$/.test(line)) {
       pendingMarket = line;
       continue;
@@ -208,13 +203,13 @@ function parseDartCalendar(lines, year, month) {
     }
   }
 
-  // keep only complete ranges
   return Array.from(map.values()).filter((x) => x.sbd_start && x.sbd_end);
 }
 
 function parseKindListedSet(html) {
-  // KIND "download" is HTML table disguised as xls
+  // KIND 다운로드는 "엑셀처럼 보이는 HTML 테이블" 형태가 흔함
   const set = new Set();
+
   const rowRe = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
   let rm;
   while ((rm = rowRe.exec(html)) !== null) {
@@ -230,59 +225,63 @@ function parseKindListedSet(html) {
 
     if (cells.length < 2) continue;
 
-    // detect which cell is stock code (6 digits)
-    let nameCell = cells[0];
-    if (/^\d{6}$/.test(cells[0]) && cells[1]) nameCell = cells[1];
-    else if (/^\d{6}$/.test(cells[1]) && cells[0]) nameCell = cells[0];
+    // 보통 "회사명 / 종목코드 / 업종 ..." 순서인데 케이스별로 섞일 수 있어 방어적으로 처리
+    let name = cells[0];
+    if (/^\d{6}$/.test(cells[0]) && cells[1]) name = cells[1];
+    else if (/^\d{6}$/.test(cells[1]) && cells[0]) name = cells[0];
 
-    const key = normName(nameCell);
+    const key = normName(name);
     if (key) set.add(key);
   }
+
   return set;
 }
 
 async function getListedSet() {
   const now = Date.now();
   if (LISTED_CACHE.set && now - LISTED_CACHE.ts < LISTED_TTL_MS) {
-    return { set: LISTED_CACHE.set, stale: false };
+    return { set: LISTED_CACHE.set, stale: false, size: LISTED_CACHE.set.size };
   }
 
-  // if we have something cached, keep it as fallback even if refresh fails
   const fallback = LISTED_CACHE.set;
 
   try {
-    const r = await requestText(KIND_LIST_URL, { timeoutMs: 9000 });
-    if (r.status !== 200 || !r.text) throw new Error(`KIND HTTP ${r.status}`);
-    const set = parseKindListedSet(r.text);
+    const r = await requestBuffer(KIND_LIST_URL, { timeoutMs: 10000 });
+    if (r.status !== 200 || !r.buf || r.buf.length < 1000) throw new Error(`KIND HTTP ${r.status}`);
+
+    const html = decodeKIND(r.buf);
+
+    const set = parseKindListedSet(html);
+
+    // sanity check: 너무 작으면 파싱 실패로 간주
+    if (set.size < 500) throw new Error(`KIND parse too small: ${set.size}`);
+
     LISTED_CACHE = { ts: now, set };
-    return { set, stale: false };
+    return { set, stale: false, size: set.size };
   } catch (e) {
-    if (fallback) return { set: fallback, stale: true };
-    return { set: null, stale: true };
+    if (fallback) return { set: fallback, stale: true, size: fallback.size, err: String(e.message || e) };
+    return { set: null, stale: true, size: 0, err: String(e.message || e) };
   }
 }
 
 exports.handler = async (event) => {
   try {
     const qs = event.queryStringParameters || {};
-    const now = new Date();
-
-    const year = String(qs.year || now.getFullYear());
-    const monthRaw = qs.month || String(now.getMonth() + 1);
-    const month = parseInt(monthRaw, 10);
+    const year = String(qs.year || new Date().getFullYear());
+    const month = parseInt(String(qs.month || new Date().getMonth() + 1), 10);
+    const debug = String(qs.debug || "") === "1";
 
     if (!/^\d{4}$/.test(year) || !(month >= 1 && month <= 12)) {
-      return safeJson(200, { ok: false, error: "Bad year/month" });
+      return safeJson({ ok: false, error: "Bad year/month" });
     }
 
-    // ---- fetch DART calendar ----
-    // DART 페이지가 폼 제출 구조라서 POST로도 보내고, 혹시 무시되면 기본 페이지라도 파싱되게 함.
+    // DART: POST로 월 선택
     const body = new URLSearchParams({
       selectYear: year,
       selectMonth: pad2(month),
     }).toString();
 
-    const dartRes = await requestText(DART_CAL_URL, {
+    const dartRes = await requestTextUtf8(DART_CAL_URL, {
       method: "POST",
       headers: {
         "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -292,40 +291,51 @@ exports.handler = async (event) => {
     });
 
     if (dartRes.status !== 200 || !dartRes.text) {
-      return safeJson(200, { ok: false, error: `DART HTTP ${dartRes.status}` });
+      return safeJson({ ok: false, error: `DART HTTP ${dartRes.status}` });
     }
 
     const lines = htmlToLines(dartRes.text);
     const rawItems = parseDartCalendar(lines, year, month);
 
-    // ---- listed-company filter via KIND ----
     const listedInfo = await getListedSet();
     const listedSet = listedInfo.set;
 
-    let items = rawItems;
     let excluded_listed = 0;
+    let items = rawItems;
 
+    let matched_listed = [];
     if (listedSet) {
       const before = items.length;
+      matched_listed = items
+        .map((it) => it.corp_name)
+        .filter((nm) => listedSet.has(normName(nm)));
+
       items = items.filter((it) => !listedSet.has(normName(it.corp_name)));
       excluded_listed = before - items.length;
     }
 
-    return safeJson(200, {
+    const out = {
       ok: true,
-      source: "dart-dsac008 + kind-listed-filter",
+      source: "dart-dsac008 + kind-listed-filter(euc-kr)",
       year,
       month: pad2(month),
       count: items.length,
       excluded_listed,
-      listed_filter_stale: listedInfo.stale, // true면 KIND 목록 갱신 실패(캐시 사용 or 미적용)
+      listed_filter_stale: listedInfo.stale,
+      listed_set_size: listedInfo.size,
       items,
-    });
+    };
+
+    if (debug) {
+      out.debug = {
+        listed_err: listedInfo.err || null,
+        matched_listed_first_50: matched_listed.slice(0, 50),
+        raw_count: rawItems.length,
+      };
+    }
+
+    return safeJson(out);
   } catch (e) {
-    // 절대 throw로 죽지 않게: 502 방지
-    return safeJson(200, {
-      ok: false,
-      error: String(e && e.message ? e.message : e),
-    });
+    return safeJson({ ok: false, error: String(e && e.message ? e.message : e) });
   }
 };
