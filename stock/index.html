@@ -4,109 +4,47 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>공모 알림 (4인가족)</title>
-
   <link rel="manifest" href="manifest.webmanifest">
   <meta name="theme-color" content="#111111" />
   <link rel="stylesheet" href="styles.css" />
 </head>
-
 <body>
   <header class="header">
     <div class="title">
       <h1>공모 알림</h1>
-      <p>가족 4인 체크 + 캘린더 알림(.ics) + DART 원클릭</p>
+      <p>가족 체크 + 캘린더(.ics) + 미리알림(단축어) + 자동 가져오기</p>
     </div>
-
     <nav class="tabs">
-      <button class="tab active" data-tab="events" type="button">일정</button>
-      <button class="tab" data-tab="family" type="button">가족</button>
-      <button class="tab" data-tab="export" type="button">내보내기</button>
+      <button class="tab active" data-tab="events">일정</button>
+      <button class="tab" data-tab="family">가족</button>
+      <button class="tab" data-tab="export">내보내기</button>
     </nav>
   </header>
 
   <main class="main">
-
     <!-- EVENTS -->
     <section id="tab-events" class="panel active">
       <div class="card">
-        <h2>DART에서 원클릭 가져오기</h2>
-
-        <div class="form">
-          <div class="row">
-            <label>
-              Year
-              <input id="dart-year" type="number" min="2016" />
-            </label>
-            <label>
-              Month
-              <input id="dart-month" type="number" min="1" max="12" />
-            </label>
-          </div>
-
-          <button id="import-dart" class="btn primary" type="button">
-            DART에서 일정 자동 채우기
-          </button>
-
-          <small id="import-status" class="muted"></small>
-          <small class="muted">
-            ※ 출처: DART 청약달력(지분증권). 일정은 참고용이며 최종은 공지 확인.
-          </small>
+        <h2>자동 가져오기</h2>
+        <p class="muted">
+          범위: <b>오늘 ~ 다음달 말</b> (이번달+다음달을 자동으로 합쳐서 보여줘요)
+        </p>
+        <div class="row">
+          <button id="import-dart" type="button" class="btn primary">DART에서 일정 자동 채우기</button>
+          <button id="clear-events" type="button" class="btn">가져온 일정 초기화</button>
         </div>
-      </div>
-
-      <div class="card">
-        <h2>청약 일정 추가</h2>
-
-        <form id="event-form" class="form">
-          <label>
-            회사명
-            <input id="companyName" required placeholder="예: 케이뱅크" />
-          </label>
-
-          <div class="row">
-            <label>
-              청약 시작일
-              <input id="startDate" type="date" required />
-            </label>
-            <label>
-              청약 종료일
-              <input id="endDate" type="date" required />
-            </label>
-          </div>
-
-          <label>
-            주간사/가능 증권사 (메모)
-            <input id="underwriters" placeholder="예: 미래에셋, NH, 키움" />
-          </label>
-
-          <label>
-            메모
-            <input id="memo" placeholder="예: 균등/비례, 우대조건 등" />
-          </label>
-
-          <label class="inline">
-            <input id="starred" type="checkbox" checked />
-            관심(⭐) — 캘린더 알림 포함
-          </label>
-
-          <button type="submit" class="btn primary">추가</button>
-        </form>
+        <div id="import-status" class="muted" style="margin-top:8px;"></div>
+        <small class="muted">
+          * “증권사/균등 최소금액”은 보조 데이터(38 표)를 합쳐서 보여줍니다. 최종 확정은 공시로 확인하세요.
+        </small>
       </div>
 
       <div class="card">
         <div class="row space">
-          <h2>등록된 일정</h2>
-          <small class="muted">⭐만 캘린더로 내보내면 알림이 과해지는 걸 막을 수 있어요.</small>
+          <h2>공모주 일정</h2>
+          <small class="muted">가족별 체크(청약 완료/준비)를 눌러서 관리하세요.</small>
         </div>
-
         <div id="events-list" class="list"></div>
-      </div>
-
-      <div class="card note">
-        <h3>주의</h3>
-        <p class="muted">
-          일정은 참고용입니다. 최종 청약 일정/주간사는 반드시 공식 공지로 확인하세요.
-        </p>
       </div>
     </section>
 
@@ -114,7 +52,6 @@
     <section id="tab-family" class="panel">
       <div class="card">
         <h2>가족 관리</h2>
-
         <form id="family-form" class="form">
           <div class="row">
             <label>
@@ -142,44 +79,61 @@
       <div class="card">
         <h2>캘린더(.ics) 내보내기</h2>
         <p class="muted">
-          아이폰에서는 .ics 파일을 열면 Apple Calendar로 “가져오기”가 됩니다.
-          가져온 뒤에는 캘린더 알림이 폰에서 자동으로 울려요.
+          iPhone에서 .ics 파일을 열면 캘린더로 가져오기 됩니다.
+          일정 설명에 <b>증권사 + 균등 최소금액</b>을 넣어드려요.
         </p>
-
-        <div class="form">
-          <label>
-            캘린더 이름(표시용)
-            <input id="calName" value="공모 알림" />
-          </label>
-
-          <div class="row">
-            <button id="export-starred" class="btn primary" type="button">⭐ 관심 일정만 .ics 다운로드</button>
-            <button id="export-all" class="btn" type="button">전체 일정 .ics 다운로드</button>
-          </div>
-
-          <details class="details">
-            <summary>아이폰에서 알림 제대로 울리게 설정</summary>
-            <ul class="muted">
-              <li>캘린더 앱 → <b>캘린더</b> → 새 캘린더(예: “공모 알림”)를 만들어두면 관리가 쉬워요.</li>
-              <li>.ics 가져올 때 그 캘린더로 넣으면, 나중에 캘린더만 꺼/삭제하면 정리 끝.</li>
-              <li>설정 → 알림 → 캘린더 → 알림 허용이 켜져 있어야 해요.</li>
-            </ul>
-          </details>
+        <div class="row">
+          <button id="export-cal" class="btn primary">캘린더(.ics) 다운로드</button>
+          <button id="export-reminders-ics" class="btn">미리알림용(.ics) 다운로드(실험)</button>
         </div>
+        <small class="muted">
+          * “미리알림용 .ics”는 기기/설정에 따라 동작이 다를 수 있어요. 확실한 건 아래 단축어 방식.
+        </small>
       </div>
 
       <div class="card">
-        <h2>이번 MVP에서 “자동 계좌조회/자동송금”은 제외</h2>
+        <h2>미리알림(아이폰 기본 앱) 추가</h2>
         <p class="muted">
-          가족 계좌/잔고 통합 자동조회는 금융 연동 허들이 커서 2단계로 두는 게 현실적이에요.
-          대신 체크리스트로 “예수금 확인 / 청약 완료”를 빠르게 관리하게 했어요.
+          웹앱에서 미리알림 앱에 직접 추가는 iOS 보안 때문에 불가라서,
+          <b>단축어(Shortcuts)</b> 1개만 만들어두면 버튼 한 번으로 자동 생성되게 할 수 있어요.
         </p>
+
+        <div class="row">
+          <button id="open-shortcut-help" class="btn primary">단축어 만들기 안내 보기</button>
+          <button id="run-shortcut" class="btn">미리알림으로 추가(단축어 실행)</button>
+        </div>
+
+        <details class="details" id="shortcut-help" style="margin-top:10px;">
+          <summary>단축어 만들기 (딱 1번만)</summary>
+          <ol class="muted">
+            <li>iPhone에서 <b>단축어</b> 앱 열기</li>
+            <li><b>+</b> → ‘새 단축어’ 만들기</li>
+            <li>이름을 정확히 <b>공모주 미리알림 추가</b> 로 설정</li>
+            <li>동작 추가:
+              <ul>
+                <li><b>URL 내용 가져오기</b> (Get Contents of URL)</li>
+                <li>URL: (단축어 입력으로 받을 예정) → “단축어 입력” 사용</li>
+                <li>결과는 JSON</li>
+              </ul>
+            </li>
+            <li>동작 추가:
+              <ul>
+                <li><b>반복</b> (Repeat with Each) — items 배열 반복</li>
+                <li><b>미리알림 추가</b> (Add New Reminder)</li>
+                <li>제목: “{회사명} 청약 준비”</li>
+                <li>마감일: 시작일 - 1일</li>
+                <li>메모: 증권사/균등금액</li>
+              </ul>
+            </li>
+            <li>저장</li>
+          </ol>
+          <p class="muted">단축어가 한 번 만들어지면, 웹앱에서 “미리알림으로 추가” 버튼이 단축어를 실행합니다.</p>
+        </details>
       </div>
     </section>
   </main>
 
-  <!-- JS (defer로 안전하게) -->
-  <script src="app.js" defer></script>
+  <script src="app.js"></script>
   <script>
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('./sw.js').catch(()=>{});
