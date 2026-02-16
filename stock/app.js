@@ -28,6 +28,86 @@ function defaultStore() {
 }
 
 let store = loadStore() ?? defaultStore();
+// (옵션) 콘솔에서도 store를 보고 싶으면 이 줄 추가
+// window.store = store;
+
+document.addEventListener("DOMContentLoaded", () => {
+  const btn = document.getElementById("import-dart");
+  const status = document.getElementById("import-status");
+  if (!btn) return;
+
+  btn.addEventListener("click", async () => {
+    try {
+      btn.disabled = true;
+      if (status) status.textContent = "DART에서 불러오는 중…";
+
+      const now = new Date();
+      const year = String(now.getFullYear());
+      const month = String(now.getMonth() + 1).padStart(2, "0");
+
+      // redirects가 되면 /api/... 가 먹고, 안 되면 functions로 자동 대체
+      let res = await fetch(`/api/dart-ipo?year=${year}&month=${month}`);
+      if (!res.ok) {
+        res = await fetch(`/.netlify/functions/dart-ipo?year=${year}&month=${month}`);
+      }
+
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "가져오기 실패");
+
+      // 중복 방지 (회사+시작+종료)
+      const existing = new Set(
+        (store.events || []).map(e =>
+          `${e.companyName || e.title || e.name || ""}|${e.startDate || e.start || ""}|${e.endDate || e.end || ""}`
+        )
+      );
+
+      let added = 0;
+
+      for (const it of (data.items || [])) {
+        const company = it.corp_name;
+        const start = it.sbd_start;
+        const end = it.sbd_end;
+
+        const dupKey = `${company}|${start}|${end}`;
+        if (existing.has(dupKey)) continue;
+
+        // 네 앱 필드명이 뭔지 몰라도 되게 여러 키를 같이 넣음
+        const ev = {
+          id: uid(),
+          companyName: company,
+          title: `${company} 청약 (${it.market_short})`,
+          name: company,
+
+          startDate: start,
+          endDate: end,
+          start: start,
+          end: end,
+
+          memo: `출처: DART 청약달력 (${it.market_short})`,
+          note: `출처: DART 청약달력 (${it.market_short})`,
+
+          perMember: {}
+        };
+
+        store.events.push(ev);
+        existing.add(dupKey);
+        added++;
+      }
+
+      saveStore(store);
+      renderAll();
+
+      if (status) status.textContent = `완료! ${added}개 추가됨 (${year}-${month})`;
+    } catch (e) {
+      console.error(e);
+      if (status) status.textContent = `실패: ${e.message || e}`;
+      alert(`DART 가져오기 실패: ${e.message || e}`);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+});
+
 saveStore(store);
 
 // ---------- Tabs ----------
@@ -615,3 +695,4 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 });
+
