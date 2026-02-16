@@ -4,32 +4,63 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>공모 알림 (4인가족)</title>
+
   <link rel="manifest" href="manifest.webmanifest">
   <meta name="theme-color" content="#111111" />
   <link rel="stylesheet" href="styles.css" />
 </head>
+
 <body>
   <header class="header">
     <div class="title">
       <h1>공모 알림</h1>
-      <p>가족 4인 체크 + 캘린더 알림(.ics)</p>
+      <p>가족 4인 체크 + 캘린더 알림(.ics) + DART 원클릭</p>
     </div>
+
     <nav class="tabs">
-      <button class="tab active" data-tab="events">일정</button>
-      <button class="tab" data-tab="family">가족</button>
-      <button class="tab" data-tab="export">내보내기</button>
+      <button class="tab active" data-tab="events" type="button">일정</button>
+      <button class="tab" data-tab="family" type="button">가족</button>
+      <button class="tab" data-tab="export" type="button">내보내기</button>
     </nav>
   </header>
 
   <main class="main">
+
     <!-- EVENTS -->
     <section id="tab-events" class="panel active">
       <div class="card">
+        <h2>DART에서 원클릭 가져오기</h2>
+
+        <div class="form">
+          <div class="row">
+            <label>
+              Year
+              <input id="dart-year" type="number" min="2016" />
+            </label>
+            <label>
+              Month
+              <input id="dart-month" type="number" min="1" max="12" />
+            </label>
+          </div>
+
+          <button id="import-dart" class="btn primary" type="button">
+            DART에서 일정 자동 채우기
+          </button>
+
+          <small id="import-status" class="muted"></small>
+          <small class="muted">
+            ※ 출처: DART 청약달력(지분증권). 일정은 참고용이며 최종은 공지 확인.
+          </small>
+        </div>
+      </div>
+
+      <div class="card">
         <h2>청약 일정 추가</h2>
+
         <form id="event-form" class="form">
           <label>
             회사명
-            <input id="companyName" required placeholder="예: OOO" />
+            <input id="companyName" required placeholder="예: 케이뱅크" />
           </label>
 
           <div class="row">
@@ -65,8 +96,9 @@
       <div class="card">
         <div class="row space">
           <h2>등록된 일정</h2>
-          <small class="muted">팁: ⭐만 캘린더로 내보내면 알림이 과해지는 걸 막을 수 있어요.</small>
+          <small class="muted">⭐만 캘린더로 내보내면 알림이 과해지는 걸 막을 수 있어요.</small>
         </div>
+
         <div id="events-list" class="list"></div>
       </div>
 
@@ -82,6 +114,7 @@
     <section id="tab-family" class="panel">
       <div class="card">
         <h2>가족 관리</h2>
+
         <form id="family-form" class="form">
           <div class="row">
             <label>
@@ -100,7 +133,7 @@
       <div class="card">
         <h2>가족 목록</h2>
         <div id="family-list" class="list"></div>
-        <small class="muted">기본으로 4명이 자동 생성돼요. 필요하면 이름만 바꿔도 OK.</small>
+        <small class="muted">기본 4명이 자동 생성돼요. 필요하면 이름만 바꿔도 OK.</small>
       </div>
     </section>
 
@@ -120,8 +153,8 @@
           </label>
 
           <div class="row">
-            <button id="export-starred" class="btn primary">⭐ 관심 일정만 .ics 다운로드</button>
-            <button id="export-all" class="btn">전체 일정 .ics 다운로드</button>
+            <button id="export-starred" class="btn primary" type="button">⭐ 관심 일정만 .ics 다운로드</button>
+            <button id="export-all" class="btn" type="button">전체 일정 .ics 다운로드</button>
           </div>
 
           <details class="details">
@@ -136,41 +169,21 @@
       </div>
 
       <div class="card">
-        <h2>이번 MVP에서 “자동 계좌조회”는 제외</h2>
+        <h2>이번 MVP에서 “자동 계좌조회/자동송금”은 제외</h2>
         <p class="muted">
-          가족 계좌/잔고 통합 자동조회는 금융 연동(마이데이터 등) 허들이 커서 2단계로 두는 게 현실적이에요.
+          가족 계좌/잔고 통합 자동조회는 금융 연동 허들이 커서 2단계로 두는 게 현실적이에요.
           대신 체크리스트로 “예수금 확인 / 청약 완료”를 빠르게 관리하게 했어요.
         </p>
       </div>
     </section>
   </main>
 
-  <!-- MODAL -->
-  <div id="modal" class="modal hidden" aria-hidden="true">
-    <div class="modal-card">
-      <div class="modal-head">
-        <h3 id="modal-title">상세</h3>
-        <button id="modal-close" class="icon-btn" aria-label="닫기">✕</button>
-      </div>
-      <div id="modal-body"></div>
-    </div>
-  </div>
-
-  <script src="app.js"></script>
+  <!-- JS (defer로 안전하게) -->
+  <script src="app.js" defer></script>
   <script>
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('./sw.js').catch(()=>{});
     }
   </script>
-<div class="card">
-  <h2>DART에서 원클릭 가져오기</h2>
-  <div class="form">
-    <input id="dart-year" type="number" value="2026" min="2015" />
-    <input id="dart-month" type="number" value="2" min="1" max="12" />
-<button id="import-dart" type="button" onclick="alert('클릭됨')">DART에서 일정 자동 채우기</button>
-<div id="import-status"></div>
 </body>
-
 </html>
-
-
