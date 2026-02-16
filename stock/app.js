@@ -547,3 +547,71 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 });
+
+// ===== DART 원클릭 가져오기 =====
+document.addEventListener("DOMContentLoaded", () => {
+  const btn = document.getElementById("import-dart");
+  const status = document.getElementById("import-status");
+  if (!btn) return;
+
+  btn.addEventListener("click", async () => {
+    try {
+      btn.disabled = true;
+      if (status) status.textContent = "DART에서 불러오는 중…";
+
+      // 1) 가져올 년/월 (기본: 이번 달)
+      const now = new Date();
+      const year = String(now.getFullYear());
+      const month = String(now.getMonth() + 1).padStart(2, "0");
+
+      // 2) API 호출 (redirects가 안 됐으면 아래 줄을 functions로 바꿔도 됨)
+      const res = await fetch(`/api/dart-ipo?year=${year}&month=${month}`);
+      // const res = await fetch(`/.netlify/functions/dart-ipo?year=${year}&month=${month}`);
+
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "가져오기 실패");
+
+      // 3) 중복 방지용 키
+      const existing = new Set(
+        (store.events || []).map(e => `${e.title}|${e.start}|${e.end}`)
+      );
+
+      let added = 0;
+
+      // 4) items -> store.events로 변환
+      for (const it of (data.items || [])) {
+        const title = `${it.corp_name} 청약 (${it.market_short})`;
+        const start = it.sbd_start; // "YYYY-MM-DD"
+        const end = it.sbd_end;
+
+        const key = `${title}|${start}|${end}`;
+        if (existing.has(key)) continue;
+
+        const ev = {
+          id: uid(),
+          title,
+          start,   // 네 앱이 쓰는 필드명이 startDate면 알려줘. 맞춰줄게.
+          end,
+          note: `출처: DART 청약달력`,
+          perMember: {} // 가족별 체크리스트 구조 유지
+        };
+
+        store.events.push(ev);
+        existing.add(key);
+        added++;
+      }
+
+      saveStore(store);
+      renderAll();
+
+      if (status) status.textContent = `완료! ${added}개 추가됨 (${year}-${month})`;
+      if (added === 0 && status) status.textContent += " (추가할 새 일정이 없거나 0건일 수 있음)";
+    } catch (e) {
+      console.error(e);
+      if (status) status.textContent = `실패: ${e.message || e}`;
+      alert(`DART 가져오기 실패: ${e.message || e}`);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+});
