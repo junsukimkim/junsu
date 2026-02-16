@@ -68,12 +68,15 @@ function parseByTextScan(html, year, month) {
 
   const itemsMap = new Map();
   let currentDay = null;
+  let currentMarket = null;
 
-  const eventRe = /(유|코|넥|기)\s+(.+?)\s*\[(시작|종료)\]/g;
+  const marketSet = new Set(["유", "코", "넥", "기"]);
+  const dayRe = /^\d{1,2}$/; // "2", "02" 둘 다 허용
+  const corpRe = /^(.+?)\s*\[(시작|종료)\]$/; // "케이뱅크 [시작]" 형태
 
   for (const line of lines) {
-    // day 후보: 숫자만 있는 줄(1~31)
-    if (/^\d{1,2}$/.test(line)) {
+    // 1) 날짜 라인
+    if (dayRe.test(line)) {
       const d = parseInt(line, 10);
       if (d >= 1 && d <= 31) {
         currentDay = d;
@@ -81,34 +84,36 @@ function parseByTextScan(html, year, month) {
       continue;
     }
 
-    if (!currentDay) continue;
-
-    // 한 줄에 이벤트가 여러 개 있을 수 있음
-    let m;
-    while ((m = eventRe.exec(line)) !== null) {
-      const marketShort = m[1];
-      const corpName = m[2].trim();
-      const kind = m[3]; // 시작/종료
-
-      const key = `${marketShort}|${corpName}`;
-      const it =
-        itemsMap.get(key) || {
-          corp_name: corpName,
-          market_short: marketShort,
-          market: marketName(marketShort),
-          sbd_start: null,
-          sbd_end: null,
-        };
-
-      const date = ymdDash(year, month, currentDay);
-
-      if (kind === "시작") it.sbd_start = date;
-      if (kind === "종료") it.sbd_end = date;
-
-      itemsMap.set(key, it);
+    // 2) 시장 라인(유/코/넥/기) - 한 글자만 있는 줄로 내려옴
+    if (marketSet.has(line)) {
+      currentMarket = line;
+      continue;
     }
 
-    // 다음 줄에서 또 날짜가 나오기 전까지 currentDay 유지
+    // 3) 회사명 [시작/종료] 라인
+    if (!currentDay || !currentMarket) continue;
+
+    const m = line.match(corpRe);
+    if (!m) continue;
+
+    const corpName = m[1].trim();
+    const kind = m[2]; // 시작/종료
+
+    const key = `${currentMarket}|${corpName}`;
+    const it =
+      itemsMap.get(key) || {
+        corp_name: corpName,
+        market_short: currentMarket,
+        market: marketName(currentMarket),
+        sbd_start: null,
+        sbd_end: null,
+      };
+
+    const date = ymdDash(year, month, currentDay);
+    if (kind === "시작") it.sbd_start = date;
+    if (kind === "종료") it.sbd_end = date;
+
+    itemsMap.set(key, it);
   }
 
   // 시작/종료 한쪽만 있으면 같은 날로 채우기
@@ -128,6 +133,7 @@ function parseByTextScan(html, year, month) {
 
   return { items, debugLines: lines.slice(0, 200) };
 }
+
 
 exports.handler = async (event) => {
   try {
@@ -184,3 +190,4 @@ exports.handler = async (event) => {
     };
   }
 };
+
