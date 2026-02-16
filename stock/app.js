@@ -1,10 +1,9 @@
-/* ===== 공모 알림 (vNext) =====
-- 오늘~다음달 말: DART (이번달+다음달) 합치기
-- 증권사/금액: Netlify Function ipo-meta로 보조 정보 합치기
-- 수동 추가 폼 제거: 가져온 일정만 관리
-*/
+/* 공모 알림 - app.js (copy & paste) */
 
-const LS_KEY = "ipo_app_vnext";
+const LS_KEY = "ipo_alarm_store_v4";
+const SHORTCUT_NAME = "공모주 미리알림 추가"; // iOS 단축어 이름(이름이 정확히 같아야 함)
+
+const $ = (sel) => document.querySelector(sel);
 
 function uid() {
   return (crypto?.randomUUID?.() ?? "id-" + Math.random().toString(16).slice(2));
@@ -27,84 +26,258 @@ function defaultStore() {
     { id: uid(), name: "자녀1", brokerNote: "" },
     { id: uid(), name: "자녀2", brokerNote: "" },
   ];
-  return { members, events: [], metaCache: {} };
+  return {
+    members,
+    // events: 자동 가져오기 결과만 저장 (수동 추가 없음)
+    events: [],
+    lastImport: null
+  };
 }
 
-window.store = loadStore() || defaultStore();
-saveStore(window.store);
-
-function $(id) { return document.getElementById(id); }
-function escHtml(s) {
-  return String(s ?? "").replace(/[&<>"']/g, m => ({
-    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
-  }[m]));
+function normName(s) {
+  return String(s || "")
+    .replace(/\s+/g, "")
+    .replace(/[()［］\[\]{}]/g, "")
+    .trim();
 }
-function norm(s) { return String(s ?? "").replace(/\s+/g, "").trim(); }
-function pad2(n) { return String(n).padStart(2, "0"); }
 
-function kstNowDate() {
+function eventKey(e) {
+  return `${normName(e.corp_name)}|${e.sbd_start}|${e.sbd_end}`;
+}
+
+function fmtDate(iso) {
+  // iso: YYYY-MM-DD
+  return iso;
+}
+
+function fmtMoneyKRW(n) {
+  if (n == null || Number.isNaN(Number(n))) return "(정보없음)";
+  const v = Math.round(Number(n));
+  return v.toLocaleString("ko-KR") + "원";
+}
+
+function todaySeoulISO() {
+  // 브라우저(사용자) 로컬 기준으로 YYYY-MM-DD
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function endOfNextMonthISO() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = d.getMonth(); // 0-based
+  // next month end: month+2, day=0 => last day of (month+1)
+  const end = new Date(y, m + 2, 0);
+  const yy = end.getFullYear();
+  const mm = String(end.getMonth() + 1).padStart(2, "0");
+  const dd = String(end.getDate()).padStart(2, "0");
+  return `${yy}-${mm}-${dd}`;
+}
+
+function overlapsRange(start, end, from, to) {
+  // inclusive dates
+  return !(end < from || start > to);
+}
+
+function dedupeAndMergeChecks(oldEvents, newEvents) {
+  // 1) 중복 제거(회사+기간 기준)
+  const map = new Map();
+  for (const e of newEvents) {
+    map.set(eventKey(e), e);
+  }
+  let merged = Array.from(map.values());
+
+  // 2) “회사명만 같은데 날짜가 밀려서 2번 들어오는” 케이스 방지:
+  //    같은 corp_name이 여러 개면 가장 빠른 것 1개만 남김 (원하면 이 블록 삭제 가능)
+  const byCorp = new Map();
+  for (const e of merged) {
+    const k = normName(e.corp_name);
+    const prev = byCorp.get(k);
+    if (!prev) byCorp.set(k, e);
+    else {
+      // 더 이른 시작일 우선
+      if (String(e.sbd_start) < String(prev.sbd_start)) byCorp.set(k, e);
+    }
+  }
+  merged = Array.from(byCorp.values());
+
+  // 3) 기존 체크(perMember) 유지
+  const oldMap = new Map(oldEvents.map(e => [eventKey(e), e]));
+  for (const e of merged) {
+    const old = oldMap.get(eventKey(e));
+    if (old?.perMember) e.perMember = old.perMember;
+    if (typeof e.starred === "undefined") e.starred = true;
+  }
+
+  // 정렬
+  merged.sort((a, b) => String(a.sbd_start).localeCompare(String(b.sbd_start)));
+  return merged;
+}
+
+function downloadText(filename, text) {
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    URL.revokeObjectURL(a.href);
+    a.remove();
+  }, 200);
+}
+
+/* ===== ICS (Calendar) ===== */
+
+function icsEscape(s) {
+  return String(s || "")
+    .replace(/\\/g, "\\\\")
+    .replace(/\n/g, "\\n")
+    .replace(/,/g, "\\,")
+    .replace(/;/g, "\\;");
+}
+
+function ymdToICSDate(ymd) {
+  // YYYY-MM-DD -> YYYYMMDD
+  return ymd.replace(/-/g, "");
+}
+
+function addDaysISO(ymd, days) {
+  const [y, m, d] = ymd.split("-").map(Number);
+  const dt = new Date(y, m - 1, d);
+  dt.setDate(dt.getDate() + days);
+  const yy = dt.getFullYear();
+  const mm = String(dt.getMonth() + 1).padStart(2, "0");
+  const dd = String(dt.getDate()).padStart(2, "0");
+  return `${yy}-${mm}-${dd}`;
+}
+
+function buildEventDescription(e, members) {
+  const brokers = e.underwriters && e.underwriters.length ? e.underwriters.join(", ") : "(정보없음)";
+  const per = fmtMoneyKRW(e.equal_min_deposit);
+  const total = (e.equal_min_deposit != null) ? fmtMoneyKRW(e.equal_min_deposit * members.length) : "(정보없음)";
+  const lines = [
+    `회사: ${e.corp_name}`,
+    `청약: ${e.sbd_start} ~ ${e.sbd_end}`,
+    `증권사: ${brokers}`,
+    `균등 최소증거금(1인): ${per}`,
+    `4인가족 총 필요(참고): ${total}`,
+    e.price_note ? `가격/근거: ${e.price_note}` : "",
+    e.source_note ? `출처: ${e.source_note}` : ""
+  ].filter(Boolean);
+  return lines.join("\n");
+}
+
+function buildICS(calName, events, members) {
   const now = new Date();
-  const kst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
-  return new Date(Date.UTC(kst.getUTCFullYear(), kst.getUTCMonth(), kst.getUTCDate()));
-}
-function ymd(d) {
-  const yyyy = d.getUTCFullYear();
-  const mm = pad2(d.getUTCMonth() + 1);
-  const dd = pad2(d.getUTCDate());
-  return `${yyyy}-${mm}-${dd}`;
-}
-function endOfNextMonthKST() {
-  const base = kstNowDate();
-  const y = base.getUTCFullYear();
-  const m = base.getUTCMonth(); // 0-based
-  // next month end = day 0 of month+2
-  return new Date(Date.UTC(y, m + 2, 0));
-}
-function addDaysYMD(ymdStr, days) {
-  const [y,m,d] = ymdStr.split("-").map(Number);
-  const dt = new Date(Date.UTC(y, m-1, d));
-  dt.setUTCDate(dt.getUTCDate() + days);
-  return ymd(dt);
+  const dtstamp =
+    now.getUTCFullYear().toString().padStart(4, "0") +
+    String(now.getUTCMonth() + 1).padStart(2, "0") +
+    String(now.getUTCDate()).padStart(2, "0") + "T" +
+    String(now.getUTCHours()).padStart(2, "0") +
+    String(now.getUTCMinutes()).padStart(2, "0") +
+    String(now.getUTCSeconds()).padStart(2, "0") + "Z";
+
+  let out = "";
+  out += "BEGIN:VCALENDAR\n";
+  out += "VERSION:2.0\n";
+  out += "PRODID:-//IPO Alarm//KR//EN\n";
+  out += "CALSCALE:GREGORIAN\n";
+  out += `X-WR-CALNAME:${icsEscape(calName)}\n`;
+
+  for (const e of events) {
+    const uidStr = `${eventKey(e)}@ipo-alarm`;
+    const dtstart = ymdToICSDate(e.sbd_start);
+    const dtend = ymdToICSDate(addDaysISO(e.sbd_end, 1)); // DTEND는 보통 종료 다음날(종일 일정)
+    const summary = `[공모주] ${e.corp_name} 청약`;
+    const desc = buildEventDescription(e, members);
+
+    out += "BEGIN:VEVENT\n";
+    out += `UID:${icsEscape(uidStr)}\n`;
+    out += `DTSTAMP:${dtstamp}\n`;
+    out += `SUMMARY:${icsEscape(summary)}\n`;
+    out += `DTSTART;VALUE=DATE:${dtstart}\n`;
+    out += `DTEND;VALUE=DATE:${dtend}\n`;
+    out += `DESCRIPTION:${icsEscape(desc)}\n`;
+    out += "END:VEVENT\n";
+  }
+
+  out += "END:VCALENDAR\n";
+  return out;
 }
 
-function fmtKRW(n) {
-  if (n == null || Number.isNaN(Number(n))) return "";
-  return Number(n).toLocaleString("ko-KR") + "원";
+/* ===== iOS Reminders (Shortcuts) ===== */
+
+function buildShortcutPayload(e, members) {
+  // 단축어로 넘길 JSON (단축어에서 파싱해서 미리알림 생성)
+  const brokers = e.underwriters && e.underwriters.length ? e.underwriters.join(", ") : "(정보없음)";
+  const per = fmtMoneyKRW(e.equal_min_deposit);
+  const total = (e.equal_min_deposit != null) ? fmtMoneyKRW(e.equal_min_deposit * members.length) : "(정보없음)";
+
+  // 알림은 “청약 시작 전날”로 추천(원하면 단축어에서 변경)
+  const due = addDaysISO(e.sbd_start, -1);
+
+  return {
+    title: `[공모주] ${e.corp_name} 청약`,
+    dueDate: due,
+    notes:
+      `청약: ${e.sbd_start} ~ ${e.sbd_end}\n` +
+      `증권사: ${brokers}\n` +
+      `균등 최소증거금(1인): ${per}\n` +
+      `4인가족 총 필요(참고): ${total}\n` +
+      (e.price_note ? `가격/근거: ${e.price_note}\n` : "") +
+      (e.source_note ? `출처: ${e.source_note}\n` : ""),
+  };
 }
 
-function stableEventId(e) {
-  return "e-" + btoa(unescape(encodeURIComponent(`${e.corp_name}|${e.sbd_start}|${e.sbd_end}`))).replace(/=+$/,"");
+function openShortcutRun(payloadObj) {
+  const text = JSON.stringify(payloadObj);
+  const url =
+    "shortcuts://run-shortcut" +
+    `?name=${encodeURIComponent(SHORTCUT_NAME)}` +
+    `&input=text` +
+    `&text=${encodeURIComponent(text)}`;
+  location.href = url;
 }
 
-/* ===== Tabs ===== */
-function initTabs() {
+/* ===== UI Rendering ===== */
+
+let store = loadStore() || defaultStore();
+
+function renderTabs() {
   document.querySelectorAll(".tab").forEach(btn => {
     btn.addEventListener("click", () => {
       const tab = btn.dataset.tab;
-      document.querySelectorAll(".tab").forEach(b => b.classList.toggle("active", b === btn));
-      document.querySelectorAll(".panel").forEach(p => p.classList.toggle("active", p.id === `tab-${tab}`));
+      document.querySelectorAll(".tab").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
+      document.querySelector(`#tab-${tab}`)?.classList.add("active");
     });
   });
 }
 
-/* ===== Render family ===== */
 function renderFamily() {
-  const box = $("family-list");
+  const box = $("#family-list");
+  if (!box) return;
   box.innerHTML = "";
 
-  window.store.members.forEach(m => {
+  store.members.forEach(m => {
     const row = document.createElement("div");
     row.className = "item";
+
     row.innerHTML = `
-      <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;">
+      <div class="row space" style="gap:10px;">
         <div>
-          <div style="font-weight:700;">${escHtml(m.name)}</div>
-          <div class="muted">${escHtml(m.brokerNote || "")}</div>
+          <b>${m.name}</b>
+          <div class="muted" style="margin-top:4px;">${m.brokerNote ? `메모: ${m.brokerNote}` : ""}</div>
         </div>
-        <div style="display:flex;gap:8px;align-items:center;">
-          <button class="btn" data-act="rename" data-id="${escHtml(m.id)}">이름</button>
-          <button class="btn" data-act="note" data-id="${escHtml(m.id)}">메모</button>
-          <button class="btn" data-act="del" data-id="${escHtml(m.id)}">삭제</button>
+        <div class="row" style="gap:8px;">
+          <button class="btn" data-act="rename" data-id="${m.id}">이름</button>
+          <button class="btn" data-act="note" data-id="${m.id}">메모</button>
+          <button class="btn" data-act="del" data-id="${m.id}">삭제</button>
         </div>
       </div>
     `;
@@ -115,26 +288,29 @@ function renderFamily() {
     btn.addEventListener("click", () => {
       const id = btn.dataset.id;
       const act = btn.dataset.act;
-      const m = window.store.members.find(x => x.id === id);
-      if (!m) return;
 
       if (act === "del") {
-        window.store.members = window.store.members.filter(x => x.id !== id);
-        window.store.events.forEach(e => { if (e.perMember) delete e.perMember[id]; });
-        saveStore(window.store);
+        store.members = store.members.filter(x => x.id !== id);
+        // 체크 정보에서도 제거
+        store.events.forEach(e => { if (e.perMember) delete e.perMember[id]; });
+        saveStore(store);
         renderAll();
       } else if (act === "rename") {
+        const m = store.members.find(x => x.id === id);
+        if (!m) return;
         const newName = prompt("이름", m.name);
         if (newName && newName.trim()) {
           m.name = newName.trim();
-          saveStore(window.store);
+          saveStore(store);
           renderAll();
         }
       } else if (act === "note") {
-        const newNote = prompt("증권사 메모", m.brokerNote || "");
+        const m = store.members.find(x => x.id === id);
+        if (!m) return;
+        const newNote = prompt("증권사 메모(선택)", m.brokerNote || "");
         if (newNote != null) {
           m.brokerNote = newNote.trim();
-          saveStore(window.store);
+          saveStore(store);
           renderAll();
         }
       }
@@ -142,420 +318,196 @@ function renderFamily() {
   });
 }
 
-/* ===== Render events ===== */
 function renderEvents() {
-  const box = $("events-list");
+  const box = $("#events-list");
+  if (!box) return;
   box.innerHTML = "";
 
-  const today = ymd(kstNowDate());
-  const end = ymd(endOfNextMonthKST());
-
-  const events = (window.store.events || [])
-    .filter(e => (e.sbd_end || "") >= today && (e.sbd_start || "") <= end)
-    .sort((a,b) => String(a.sbd_start).localeCompare(String(b.sbd_start)));
-
-  if (events.length === 0) {
-    box.innerHTML = `<div class="muted">아직 가져온 일정이 없어요. 위 버튼을 눌러 자동 채우기!</div>`;
+  if (!store.events.length) {
+    box.innerHTML = `<div class="muted">아직 일정이 없습니다. 위에서 “공모주 일정 자동 채우기”를 눌러주세요.</div>`;
     return;
   }
 
-  const memberIds = window.store.members.map(m => m.id);
+  store.events.forEach(e => {
+    const item = document.createElement("div");
+    item.className = "item";
 
-  events.forEach(e => {
+    const brokers = e.underwriters && e.underwriters.length ? e.underwriters.join(", ") : "(정보없음)";
+    const per = fmtMoneyKRW(e.equal_min_deposit);
+    const total = (e.equal_min_deposit != null) ? fmtMoneyKRW(e.equal_min_deposit * store.members.length) : "(정보없음)";
+
     if (!e.perMember) e.perMember = {};
-    memberIds.forEach(id => { if (!e.perMember[id]) e.perMember[id] = { done:false }; });
 
-    const brokers = e.brokers || "";
-    const dep = e.min_deposit_krw ?? null;
-    const depNote = e.min_deposit_note || "";
-    const familyTotal = (dep != null) ? dep * window.store.members.length : null;
+    const checksHtml = store.members.map(m => {
+      const checked = e.perMember[m.id] ? "checked" : "";
+      return `
+        <label class="inline" style="gap:8px;">
+          <input type="checkbox" data-mid="${m.id}" data-ek="${eventKey(e)}" ${checked} />
+          ${m.name}
+        </label>
+      `;
+    }).join("");
 
-    const card = document.createElement("div");
-    card.className = "item";
-    card.innerHTML = `
-      <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
-        <div style="flex:1;">
-          <div style="font-weight:800;font-size:16px;">${escHtml(e.corp_name)}</div>
-          <div class="muted">청약: ${escHtml(e.sbd_start)} ~ ${escHtml(e.sbd_end)}</div>
-          ${brokers ? `<div class="muted">증권사: ${escHtml(brokers)}</div>` : `<div class="muted">증권사: (불러오는 중/없음)</div>`}
-          ${dep != null
-            ? `<div class="muted">균등 최소(추정): <b>${escHtml(fmtKRW(dep))}</b> / 1인
-               ${familyTotal != null ? ` · 4인합: <b>${escHtml(fmtKRW(familyTotal))}</b>` : ""}</div>`
-            : `<div class="muted">균등 최소금액: (공모가 미확정/정보없음)</div>`
-          }
-          ${depNote ? `<div class="muted">${escHtml(depNote)}</div>` : ""}
+    item.innerHTML = `
+      <div class="row space" style="align-items:flex-start; gap:10px;">
+        <div style="min-width:180px;">
+          <div style="font-size:18px; font-weight:700;">${e.corp_name}</div>
+          <div class="muted" style="margin-top:6px;">청약: ${fmtDate(e.sbd_start)} ~ ${fmtDate(e.sbd_end)}</div>
+          <div class="muted" style="margin-top:6px;">증권사: ${brokers}</div>
+          <div class="muted" style="margin-top:6px;">균등 최소증거금(1인): <b>${per}</b></div>
+          <div class="muted" style="margin-top:6px;">가족 합계(참고): <b>${total}</b></div>
         </div>
-        <div style="display:flex;gap:8px;align-items:center;">
-          <button class="btn" data-act="ics" data-id="${escHtml(e.id)}">캘린더</button>
+
+        <div class="row" style="gap:8px; flex-wrap:wrap; justify-content:flex-end;">
+          <button class="btn" data-act="ics" data-ek="${eventKey(e)}">캘린더</button>
+          <button class="btn" data-act="rem" data-ek="${eventKey(e)}">미리알림</button>
         </div>
       </div>
 
-      <div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
-        ${window.store.members.map(m => {
-          const checked = e.perMember?.[m.id]?.done ? "checked" : "";
-          return `
-            <label class="inline" style="gap:6px;">
-              <input type="checkbox" data-act="done" data-eid="${escHtml(e.id)}" data-mid="${escHtml(m.id)}" ${checked} />
-              ${escHtml(m.name)}
-            </label>
-          `;
-        }).join("")}
+      <div style="margin-top:12px; display:flex; flex-wrap:wrap; gap:14px;">
+        ${checksHtml}
       </div>
     `;
 
-    box.appendChild(card);
+    box.appendChild(item);
   });
 
-  // handlers
-  box.querySelectorAll("input[type=checkbox][data-act=done]").forEach(cb => {
-    cb.addEventListener("change", () => {
-      const eid = cb.dataset.eid;
-      const mid = cb.dataset.mid;
-      const ev = window.store.events.find(x => x.id === eid);
+  // 체크 저장
+  box.querySelectorAll('input[type="checkbox"][data-mid]').forEach(chk => {
+    chk.addEventListener("change", () => {
+      const mid = chk.dataset.mid;
+      const ek = chk.dataset.ek;
+      const ev = store.events.find(x => eventKey(x) === ek);
       if (!ev) return;
       if (!ev.perMember) ev.perMember = {};
-      if (!ev.perMember[mid]) ev.perMember[mid] = {};
-      ev.perMember[mid].done = cb.checked;
-      saveStore(window.store);
+      if (chk.checked) ev.perMember[mid] = true;
+      else delete ev.perMember[mid];
+      saveStore(store);
     });
   });
 
-  box.querySelectorAll("button[data-act=ics]").forEach(btn => {
+  // 캘린더/미리알림 버튼
+  box.querySelectorAll("button[data-act]").forEach(btn => {
     btn.addEventListener("click", () => {
-      const eid = btn.dataset.id;
-      const ev = window.store.events.find(x => x.id === eid);
+      const act = btn.dataset.act;
+      const ek = btn.dataset.ek;
+      const ev = store.events.find(x => eventKey(x) === ek);
       if (!ev) return;
-      downloadICS([ev], `공모_${ev.corp_name}_${ev.sbd_start}.ics`, { includeAlarms:true });
+
+      if (act === "ics") {
+        const ics = buildICS("공모 알림", [ev], store.members);
+        downloadText(`ipo_${ev.corp_name}_${ev.sbd_start}.ics`, ics);
+      } else if (act === "rem") {
+        const payload = buildShortcutPayload(ev, store.members);
+        openShortcutRun(payload);
+      }
     });
   });
 }
 
-/* ===== Import logic ===== */
-async function fetchJson(url) {
-  const res = await fetch(url, { cache: "no-store" });
-  const data = await res.json().catch(() => null);
-  if (!data || data.ok !== true) {
-    const msg = data?.error || `HTTP ${res.status}`;
-    throw new Error(msg);
-  }
-  return data;
-}
-
-async function importNextToNextMonth() {
-  const status = $("import-status");
-  status.textContent = "불러오는 중… (DART 일정 + 증권사/금액 합치는 중)";
-
-  // 1) 이번달 + 다음달 DART 호출
-  const base = kstNowDate(); // UTC date with KST day
-  const y1 = base.getUTCFullYear();
-  const m1 = base.getUTCMonth() + 1;
-  const next = new Date(Date.UTC(y1, base.getUTCMonth() + 1, 1));
-  const y2 = next.getUTCFullYear();
-  const m2 = next.getUTCMonth() + 1;
-
-  const a = await fetchJson(`/.netlify/functions/dart-ipo?year=${y1}&month=${pad2(m1)}`);
-  const b = await fetchJson(`/.netlify/functions/dart-ipo?year=${y2}&month=${pad2(m2)}`);
-
-  let items = [...(a.items || []), ...(b.items || [])];
-
-  // 기간: 오늘~다음달 말
-  const today = ymd(kstNowDate());
-  const end = ymd(endOfNextMonthKST());
-  items = items.filter(it => (it.sbd_end || "") >= today && (it.sbd_start || "") <= end);
-
-  // 중복 제거
-  const seen = new Set();
-  items = items.filter(it => {
-    const k = `${norm(it.corp_name)}|${it.sbd_start}|${it.sbd_end}`;
-    if (seen.has(k)) return false;
-    seen.add(k);
-    return true;
-  });
-
-  // 2) 증권사/금액 메타 합치기
-  // 이름 목록 생성
-  const names = items.map(x => x.corp_name).filter(Boolean);
-
-  // meta 캐시(로컬) 먼저 적용
-  const metaCache = window.store.metaCache || {};
-  const need = [];
-  const meta = {};
-
-  names.forEach(n => {
-    const key = norm(n);
-    const cached = metaCache[key];
-    if (cached && cached.cached_at && (Date.now() - cached.cached_at) < 24*60*60*1000) {
-      meta[key] = cached;
-    } else {
-      need.push(n);
-    }
-  });
-
-  if (need.length > 0) {
-    try {
-      // names 파라미터는 | 로 연결
-      const param = encodeURIComponent(need.join("|"));
-      const m = await fetchJson(`/.netlify/functions/ipo-meta?names=${param}`);
-
-      (m.items || []).forEach(x => {
-        const key = norm(x.corp_name);
-        meta[key] = x;
-        metaCache[key] = { ...x, cached_at: Date.now() };
-      });
-
-      window.store.metaCache = metaCache;
-    } catch (e) {
-      console.warn("ipo-meta failed:", e);
-      // 메타 실패해도 일정은 살림
-    }
-  }
-
-  // 3) store.events로 병합(기존 체크리스트 보존)
-  const byKey = new Map(window.store.events.map(ev => {
-    const k = `${norm(ev.corp_name)}|${ev.sbd_start}|${ev.sbd_end}`;
-    return [k, ev];
-  }));
-
-  const merged = [];
-  for (const it of items) {
-    const k = `${norm(it.corp_name)}|${it.sbd_start}|${it.sbd_end}`;
-    const old = byKey.get(k);
-
-    const extra = meta[norm(it.corp_name)] || null;
-
-    const baseEvent = {
-      id: old?.id || stableEventId(it),
-      corp_name: it.corp_name,
-      sbd_start: it.sbd_start,
-      sbd_end: it.sbd_end,
-      market: it.market || "",
-      market_short: it.market_short || "",
-      perMember: old?.perMember || {},
-      brokers: extra?.brokers || old?.brokers || "",
-      offer_price_krw: extra?.offer_price_krw ?? old?.offer_price_krw ?? null,
-      min_deposit_krw: extra?.min_deposit_krw ?? old?.min_deposit_krw ?? null,
-      min_deposit_note: extra?.min_deposit_note || old?.min_deposit_note || "",
-      source_hint: extra?.source_hint || old?.source_hint || "",
-    };
-
-    merged.push(baseEvent);
-  }
-
-  // store에 반영
-  window.store.events = merged;
-  saveStore(window.store);
-  renderAll();
-
-  status.textContent = `완료! ${merged.length}개 (오늘~다음달 말)`;
-}
-
-function clearImportedEvents() {
-  if (!confirm("가져온 일정을 전부 지울까요? (가족 체크도 같이 삭제됨)")) return;
-  window.store.events = [];
-  saveStore(window.store);
-  renderAll();
-  const status = $("import-status");
-  if (status) status.textContent = "초기화 완료";
-}
-
-/* ===== ICS Export ===== */
-function icsEscape(s) {
-  return String(s ?? "")
-    .replace(/\\/g, "\\\\")
-    .replace(/\n/g, "\\n")
-    .replace(/,/g, "\\,")
-    .replace(/;/g, "\\;");
-}
-
-function downloadBlob(text, filename, mime="text/plain") {
-  const blob = new Blob([text], { type: mime });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
-
-function toICSDate(ymdStr) {
-  return ymdStr.replaceAll("-", "");
-}
-
-function buildDescription(ev) {
-  const lines = [];
-  if (ev.brokers) lines.push(`증권사: ${ev.brokers}`);
-  if (ev.min_deposit_krw != null) {
-    lines.push(`균등 최소(추정): ${fmtKRW(ev.min_deposit_krw)} / 1인`);
-    lines.push(`가족 ${window.store.members.length}인 합(추정): ${fmtKRW(ev.min_deposit_krw * window.store.members.length)}`);
-  } else {
-    lines.push(`균등 최소금액: 정보없음/미확정`);
-  }
-  if (ev.source_hint) lines.push(`출처: ${ev.source_hint}`);
-  lines.push(`* 최종 확정은 공시/증권사 공지로 확인`);
-  return lines.join("\n");
-}
-
-function downloadICS(events, filename, opts={includeAlarms:true}) {
-  const now = new Date().toISOString().replace(/[-:]/g,"").split(".")[0] + "Z";
-  let out = "";
-  out += "BEGIN:VCALENDAR\r\n";
-  out += "VERSION:2.0\r\n";
-  out += "PRODID:-//IPO Alert//KO//\r\n";
-  out += "CALSCALE:GREGORIAN\r\n";
-
-  for (const ev of events) {
-    const uidv = `${ev.id}@ipo-alert`;
-    const start = toICSDate(ev.sbd_start); // all-day
-    // all-day DTEND is next day (exclusive)
-    const endExclusive = toICSDate(addDaysYMD(ev.sbd_end, 1));
-
-    out += "BEGIN:VEVENT\r\n";
-    out += `UID:${icsEscape(uidv)}\r\n`;
-    out += `DTSTAMP:${now}\r\n`;
-    out += `SUMMARY:${icsEscape(`${ev.corp_name} 청약`)}\r\n`;
-    out += `DTSTART;VALUE=DATE:${start}\r\n`;
-    out += `DTEND;VALUE=DATE:${endExclusive}\r\n`;
-    out += `DESCRIPTION:${icsEscape(buildDescription(ev))}\r\n`;
-
-    if (opts.includeAlarms) {
-      // 3일 전, 1일 전 알림
-      out += "BEGIN:VALARM\r\n";
-      out += "ACTION:DISPLAY\r\n";
-      out += "DESCRIPTION:공모주 청약 준비\r\n";
-      out += "TRIGGER:-P3D\r\n";
-      out += "END:VALARM\r\n";
-
-      out += "BEGIN:VALARM\r\n";
-      out += "ACTION:DISPLAY\r\n";
-      out += "DESCRIPTION:공모주 청약 D-1\r\n";
-      out += "TRIGGER:-P1D\r\n";
-      out += "END:VALARM\r\n";
-    }
-
-    out += "END:VEVENT\r\n";
-  }
-
-  out += "END:VCALENDAR\r\n";
-  downloadBlob(out, filename, "text/calendar");
-}
-
-function downloadRemindersICS(events, filename) {
-  // VTODO 기반 (기기마다 import 동작 다를 수 있음)
-  const now = new Date().toISOString().replace(/[-:]/g,"").split(".")[0] + "Z";
-  let out = "";
-  out += "BEGIN:VCALENDAR\r\n";
-  out += "VERSION:2.0\r\n";
-  out += "PRODID:-//IPO Alert Reminders//KO//\r\n";
-  out += "CALSCALE:GREGORIAN\r\n";
-
-  for (const ev of events) {
-    const uidv = `${ev.id}-todo@ipo-alert`;
-    const due = toICSDate(addDaysYMD(ev.sbd_start, -1)); // 시작 1일 전
-
-    out += "BEGIN:VTODO\r\n";
-    out += `UID:${icsEscape(uidv)}\r\n`;
-    out += `DTSTAMP:${now}\r\n`;
-    out += `SUMMARY:${icsEscape(`${ev.corp_name} 청약 준비`)}\r\n`;
-    out += `DUE;VALUE=DATE:${due}\r\n`;
-    out += `DESCRIPTION:${icsEscape(buildDescription(ev))}\r\n`;
-    out += "END:VTODO\r\n";
-  }
-
-  out += "END:VCALENDAR\r\n";
-  downloadBlob(out, filename, "text/calendar");
-}
-
-/* ===== Shortcuts runner ===== */
-function runShortcutForReminders() {
-  // 단축어 이름: "공모주 미리알림 추가" (index.html 안내와 동일해야 함)
-  const shortcutName = "공모주 미리알림 추가";
-
-  // 단축어에 넘길 입력: Netlify function URL 하나만 넘기는 방식이 가장 안정적
-  // 단축어에서 "URL 내용 가져오기"로 가져오면 됨.
-  const base = kstNowDate();
-  const y1 = base.getUTCFullYear();
-  const m1 = base.getUTCMonth() + 1;
-  const next = new Date(Date.UTC(y1, base.getUTCMonth() + 1, 1));
-  const y2 = next.getUTCFullYear();
-  const m2 = next.getUTCMonth() + 1;
-
-  const payload = {
-    source: "webapp",
-    range: "today_to_end_of_next_month",
-    urls: [
-      `/.netlify/functions/dart-ipo?year=${y1}&month=${pad2(m1)}`,
-      `/.netlify/functions/dart-ipo?year=${y2}&month=${pad2(m2)}`,
-      `/.netlify/functions/ipo-meta`
-    ],
-    // 단축어가 바로 쓸 수 있게 현재 store.events도 함께 전달(옵션)
-    events: window.store.events || []
-  };
-
-  const text = encodeURIComponent(JSON.stringify(payload));
-  const url = `shortcuts://run-shortcut?name=${encodeURIComponent(shortcutName)}&input=text&text=${text}`;
-  window.location.href = url;
-}
-
-/* ===== Family add ===== */
-function initFamilyForm() {
-  const form = $("family-form");
-  form.addEventListener("submit", (e) => {
-    e.preventDefault();
-    const name = $("memberName").value.trim();
-    const note = $("brokerNote").value.trim();
-    if (!name) return;
-
-    window.store.members.push({ id: uid(), name, brokerNote: note });
-    $("memberName").value = "";
-    $("brokerNote").value = "";
-    saveStore(window.store);
-    renderAll();
-  });
-}
-
-/* ===== Export buttons ===== */
-function initExport() {
-  $("export-cal").addEventListener("click", () => {
-    const today = ymd(kstNowDate());
-    const end = ymd(endOfNextMonthKST());
-    const events = (window.store.events || []).filter(e => (e.sbd_end||"") >= today && (e.sbd_start||"") <= end);
-    downloadICS(events, `공모주_캘린더_${today}_to_${end}.ics`, { includeAlarms:true });
-  });
-
-  $("export-reminders-ics").addEventListener("click", () => {
-    const today = ymd(kstNowDate());
-    const end = ymd(endOfNextMonthKST());
-    const events = (window.store.events || []).filter(e => (e.sbd_end||"") >= today && (e.sbd_start||"") <= end);
-    downloadRemindersICS(events, `공모주_미리알림_${today}_to_${end}.ics`);
-  });
-
-  $("open-shortcut-help").addEventListener("click", () => {
-    const box = $("shortcut-help");
-    box.open = true;
-    box.scrollIntoView({ behavior: "smooth", block: "start" });
-  });
-
-  $("run-shortcut").addEventListener("click", () => {
-    runShortcutForReminders();
-  });
-}
-
-/* ===== Render all ===== */
 function renderAll() {
   renderFamily();
   renderEvents();
 }
 
-/* ===== Boot ===== */
-window.addEventListener("DOMContentLoaded", () => {
-  initTabs();
-  initFamilyForm();
-  initExport();
+/* ===== Import (오늘~다음달 말) ===== */
 
-  $("import-dart").addEventListener("click", importNextToNextMonth);
-  $("clear-events").addEventListener("click", clearImportedEvents);
+async function importIpoRange() {
+  const statusEl = $("#import-status");
+  if (statusEl) statusEl.textContent = "불러오는 중...";
 
-  renderAll();
-});
+  const from = todaySeoulISO();
+  const to = endOfNextMonthISO();
+
+  try {
+    const url = `/.netlify/functions/dart-ipo?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`;
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+
+    if (!data || !data.ok) {
+      throw new Error(data?.error || "알 수 없는 오류");
+    }
+
+    // 새 이벤트 배열 구성
+    const incoming = (data.items || []).map(x => ({
+      corp_name: x.corp_name,
+      sbd_start: x.sbd_start,
+      sbd_end: x.sbd_end,
+      underwriters: Array.isArray(x.underwriters) ? x.underwriters : (x.underwriters ? String(x.underwriters).split(",").map(s => s.trim()).filter(Boolean) : []),
+      equal_min_deposit: (x.equal_min_deposit != null) ? Number(x.equal_min_deposit) : null,
+      price_note: x.price_note || "",
+      source_note: x.source_note || "자동 가져오기",
+      starred: true,
+      perMember: {} // 아래 merge에서 기존 체크 유지됨
+    })).filter(e => overlapsRange(e.sbd_start, e.sbd_end, from, to));
+
+    // “자동 가져오기 결과는 교체” + 중복 제거 + 체크 유지
+    store.events = dedupeAndMergeChecks(store.events, incoming);
+    store.lastImport = { from, to, at: new Date().toISOString(), count: store.events.length };
+    saveStore(store);
+
+    renderAll();
+    if (statusEl) statusEl.textContent = `완료! ${store.events.length}개 (범위: ${from} ~ ${to})`;
+  } catch (err) {
+    console.error(err);
+    if (statusEl) statusEl.textContent = `가져오기 실패: ${err.message || err}`;
+    alert(`가져오기 실패: ${err.message || err}`);
+  }
+}
+
+function wireUI() {
+  renderTabs();
+
+  $("#import-ipo")?.addEventListener("click", importIpoRange);
+
+  $("#reset-import")?.addEventListener("click", () => {
+    if (!confirm("가져온 일정(체크 포함)을 모두 지울까요?")) return;
+    store.events = [];
+    store.lastImport = null;
+    saveStore(store);
+    renderAll();
+    const statusEl = $("#import-status");
+    if (statusEl) statusEl.textContent = "초기화 완료";
+  });
+
+  // family form
+  $("#family-form")?.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const name = $("#memberName")?.value?.trim();
+    const note = $("#brokerNote")?.value?.trim() || "";
+    if (!name) return;
+
+    store.members.push({ id: uid(), name, brokerNote: note });
+    $("#memberName").value = "";
+    $("#brokerNote").value = "";
+
+    saveStore(store);
+    renderAll();
+  });
+
+  // export ics
+  $("#export-all")?.addEventListener("click", () => {
+    const calName = $("#calName")?.value?.trim() || "공모 알림";
+    const ics = buildICS(calName, store.events, store.members);
+    downloadText(`ipo_calendar_${todaySeoulISO()}.ics`, ics);
+  });
+}
+
+/* ===== Start ===== */
+wireUI();
+renderAll();
+
+/* ===== iOS 단축어 만들기(사용자 안내용, 코드 실행과 무관)
+단축어 앱에서 새 단축어 만들고 "공모주 미리알림 추가"로 이름 지정.
+
+동작(추천):
+1) 동작 추가: "Get Text from Input" (입력 받기)
+2) 동작 추가: "Get Dictionary from Input" (입력: 위 텍스트)
+3) 동작 추가: "Add New Reminder"
+   - Title: Dictionary의 title
+   - Notes: Dictionary의 notes
+   - Due Date: Dictionary의 dueDate
+   - List: 원하는 목록(예: 미리알림)
+끝.
+*/
