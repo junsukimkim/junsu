@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>공모 알림 (4인가족)</title>
+  <title>공모 알림 (가족 체크)</title>
   <link rel="manifest" href="manifest.webmanifest">
   <meta name="theme-color" content="#111111" />
   <link rel="stylesheet" href="styles.css" />
@@ -13,7 +13,7 @@
   <header class="header">
     <div class="title">
       <h1>공모 알림</h1>
-      <p>가족 체크 + 캘린더(.ics) + 미리알림(공유) + 자동 가져오기</p>
+      <p>가족 체크 + 캘린더(.ics) + 미리알림(단축어) + 자동 가져오기</p>
     </div>
     <nav class="tabs">
       <button class="tab active" data-tab="events">일정</button>
@@ -28,22 +28,24 @@
       <div class="card">
         <h2>자동 가져오기</h2>
         <p class="muted">
-          범위: <b>오늘 ~ 다음달 말</b> (이번달+다음달을 합쳐서 보여줘요)
+          범위: <b>오늘 ~ 다음달 말</b> (이번달+다음달을 자동으로 합쳐서 보여줘요)
         </p>
+
         <div class="row">
-          <button id="import-dart" class="btn primary" type="button">DART에서 일정 자동 채우기</button>
-          <button id="reset-import" class="btn" type="button">가져온 일정 초기화</button>
+          <button id="import-dart-range" class="btn primary" type="button">DART에서 일정 자동 채우기</button>
+          <button id="reset-imported" class="btn" type="button">가져온 일정 초기화</button>
         </div>
+
         <div id="import-status" class="muted" style="margin-top:10px;"></div>
         <small class="muted">
-          * “증권사/균등 최소금액”은 보조 데이터(자동 추정)라 비어있을 수 있어요. 최종은 공시/증권사 공지로 확인.
+          ※ “공모주만” 필터는 <b>상장사(유상증자/권리 등)</b>를 최대한 제외하는 방식이에요. 최종은 공시로 확인!
         </small>
       </div>
 
       <div class="card">
         <div class="row space">
           <h2>공모주 일정</h2>
-          <small class="muted">체크박스로 가족별 진행상태(준비/청약완료)를 관리하세요.</small>
+          <small class="muted">오른쪽 체크박스로 가족별 “준비/청약완료” 체크만 하세요.</small>
         </div>
         <div id="events-list" class="list"></div>
       </div>
@@ -51,7 +53,7 @@
       <div class="card note">
         <h3>주의</h3>
         <p class="muted">
-          일정은 참고용입니다. 최종 일정/주간사/청약조건은 반드시 공시 및 증권사 공지로 확인하세요.
+          일정은 참고용입니다. 최종 청약 일정/주간사는 반드시 공식 공시로 확인하세요.
         </p>
       </div>
     </section>
@@ -78,7 +80,7 @@
       <div class="card">
         <h2>가족 목록</h2>
         <div id="family-list" class="list"></div>
-        <small class="muted">기본으로 4명이 자동 생성돼요. 필요하면 이름만 바꿔도 OK.</small>
+        <small class="muted">기본 4명이 자동 생성돼요. 필요하면 이름만 바꿔도 OK.</small>
       </div>
     </section>
 
@@ -87,8 +89,7 @@
       <div class="card">
         <h2>캘린더(.ics) 내보내기</h2>
         <p class="muted">
-          아이폰에서 .ics 파일을 열면 Apple Calendar로 “가져오기”가 됩니다.
-          (알림은 캘린더 설정에 따라 울려요)
+          아이폰에서는 .ics 파일을 열면 캘린더로 “가져오기”가 됩니다.
         </p>
 
         <div class="form">
@@ -98,23 +99,42 @@
           </label>
 
           <div class="row">
-            <button id="export-upcoming" class="btn primary">오늘~다음달 일정 .ics 다운로드</button>
-            <button id="export-all" class="btn">저장된 전체 일정 .ics 다운로드</button>
+            <button id="export-starred" class="btn primary" type="button">⭐ 관심 일정만 .ics 다운로드</button>
+            <button id="export-all" class="btn" type="button">전체 일정 .ics 다운로드</button>
           </div>
 
           <details class="details">
-            <summary>미리알림(아이폰 기본앱)으로 넣는 방법</summary>
+            <summary>아이폰에서 알림 제대로 울리게 설정</summary>
             <ul class="muted">
-              <li>각 일정 카드의 <b>미리알림</b> 버튼을 누르면 iOS 공유창이 떠요.</li>
-              <li>거기서 <b>미리알림</b>을 선택하면 바로 추가할 수 있어요.</li>
+              <li>캘린더 앱 → <b>캘린더</b> → 새 캘린더(예: “공모 알림”)를 만들어두면 관리가 쉬워요.</li>
+              <li>.ics 가져올 때 그 캘린더로 넣으면, 나중에 캘린더만 꺼/삭제하면 정리 끝.</li>
+              <li>설정 → 알림 → 캘린더 → 알림 허용이 켜져 있어야 해요.</li>
             </ul>
           </details>
         </div>
       </div>
+
+      <div class="card">
+        <h2>미리알림(아이폰 Reminders) 추가</h2>
+        <p class="muted">
+          웹앱에서 “미리알림”을 완전 자동으로 넣으려면 <b>단축어(Shortcuts)</b>를 한 번만 만들어야 해요.
+          일정 카드의 <b>미리알림</b> 버튼은 해당 단축어를 실행합니다.
+        </p>
+        <details class="details">
+          <summary>단축어 만들기(처음 1번만)</summary>
+          <ol class="muted">
+            <li>아이폰 “단축어” 앱 열기 → “+” 새 단축어</li>
+            <li>이름을 정확히: <b>공모주 미리알림 추가</b></li>
+            <li>동작 추가: “미리 알림 추가”</li>
+            <li>입력(텍스트)을 제목/메모에 넣도록 설정 (앱에서 전달해줌)</li>
+            <li>저장</li>
+          </ol>
+        </details>
+      </div>
     </section>
   </main>
 
-  <!-- MODAL (간단히 유지) -->
+  <!-- MODAL (남겨둠: 필요하면 확장) -->
   <div id="modal" class="modal hidden" aria-hidden="true">
     <div class="modal-card">
       <div class="modal-head">
