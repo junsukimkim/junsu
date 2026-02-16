@@ -1,15 +1,13 @@
 // stock/netlify/functions/dart-ipo.js
-// DART 청약달력(지분증권) 파싱 + "공모주(비상장/상장 전) 위주" 필터
+// DART 청약달력(지분증권) 파싱 + 공모주(상장 전) 위주 필터
 //
-// 필터( mode=ipo 기본 ):
-// 1) OpenDART corpCode.xml(Zip)에서 stock_code 있는 회사(=상장사) 제거
-// 2) market_short === '기'(ETC) 중
-//    - 종료(end)가 없거나(end_seen=false)
-//    - 시작=종료(하루짜리)
-//    -> 제거 (잡다한 유상/기타 청약 많이 줄어듦)
+// mode=all : 달력 그대로
+// mode=ipo : 상장사(stock_code 존재) 제거 + ETC(기) 잡음 일부 제거
 //
-// 필요: Netlify 환경변수 OPENDART_KEY (OpenDART 인증키)
-// OpenDART corpCode.xml: ZIP(biary) + stock_code 필드 설명은 공식 문서 참고 :contentReference[oaicite:1]{index=1}
+// Timeout 방지:
+// - OpenDART CORPCODE.xml 전체를 Set으로 만들지 않음(너무 느림)
+// - "이번 달에 나온 회사들"만 CORPCODE.xml에서 찾아서 상장사 여부 판단(빠름)
+// - CORPCODE.xml은 메모리 캐시(재사용)
 
 const https = require("node:https");
 const { inflateRawSync } = require("node:zlib");
@@ -18,6 +16,7 @@ const DART_CAL_URL = "https://dart.fss.or.kr/dsac008/main.do";
 const OPENDART_CORPCODE_ZIP_URL = (key) =>
   `https://opendart.fss.or.kr/api/corpCode.xml?crtfc_key=${encodeURIComponent(key)}`;
 
+// ---------- util ----------
 function pad2(n) {
   const s = String(n);
   return s.length === 1 ? "0" + s : s;
@@ -32,8 +31,8 @@ function normName(s) {
     .trim();
 }
 
-// ---------- fetch (Node fetch 있으면 사용, 없으면 https fallback) ----------
-function fetchTextCompat(url, { method = "GET", headers = {}, body = null, maxRedirects = 3 } = {}) {
+// ---------- fetch fallback ----------
+function fetchTextCompat(url, { method = "GET", headers = {}, body = null, maxRedirects = 2 } = {}) {
   if (typeof fetch === "function") {
     return fetch(url, {
       method,
@@ -95,7 +94,7 @@ function fetchTextCompat(url, { method = "GET", headers = {}, body = null, maxRe
   });
 }
 
-function fetchBufferCompat(url, { method = "GET", headers = {}, body = null, maxRedirects = 3 } = {}) {
+function fetchBufferCompat(url, { method = "GET", headers = {}, body = null, maxRedirects = 2 } = {}) {
   if (typeof fetch === "function") {
     return fetch(url, {
       method,
@@ -207,43 +206,55 @@ function extractFileFromZip(zipBuf, wantedName) {
   throw new Error(`File not found in ZIP: ${wantedName}`);
 }
 
-// ---------- OpenDART 상장사 이름 Set 캐시 ----------
-let listedNameSetCache = null;
-let listedNameSetLoadedAt = 0;
+// ---------- CORPCODE.xml 캐시 ----------
+let corpXmlCache = null;
+let corpXmlLoadedAt = 0;
 
-async function loadListedNameSet(opendartKey) {
-  const TTL = 7 * 24 * 60 * 60 * 1000; // 7일
-  if (listedNameSetCache && (Date.now() - listedNameSetLoadedAt) < TTL) {
-    return listedNameSetCache;
-  }
+async function getCorpXml(opendartKey) {
+  const TTL = 7 * 24 * 60 * 60 * 1000; // 7일(웜 인스턴스 기준)
+  if (corpXmlCache && (Date.now() - corpXmlLoadedAt) < TTL) return corpXmlCache;
 
   const r = await fetchBufferCompat(OPENDART_CORPCODE_ZIP_URL(opendartKey));
   if (!r.ok) throw new Error(`OpenDART corpCode download failed: HTTP ${r.status}`);
 
   const xml = extractFileFromZip(r.buf, "CORPCODE.xml");
+  corpXmlCache = xml;
+  corpXmlLoadedAt = Date.now();
+  return xml;
+}
 
-  // corp_name + stock_code만 뽑아서 "stock_code 있는 회사"를 상장사로 간주
-  // (공식 문서에 stock_code: 상장회사인 경우 종목코드(6자리) 명시) :contentReference[oaicite:2]{index=2}
-  const set = new Set();
-  const re = /<list>[\s\S]*?<corp_name>([^<]*)<\/corp_name>[\s\S]*?<stock_code>([^<]*)<\/stock_code>[\s\S]*?<\/list>/g;
+// "이번 달 회사들"만 상장사인지 찾기 (빠르게 끝내기)
+async function findListedTargets(opendartKey, targetNormSet, timeBudgetMs = 12000) {
+  const started = Date.now();
+  const xml = await getCorpXml(opendartKey);
+
+  const remaining = new Set(targetNormSet);
+  const listedFound = new Set();
+
+  // CORPCODE.xml은 corp_name 다음에 stock_code가 거의 붙어 있어서, 이 정규식이 제일 빠름
+  const re = /<corp_name>([^<]*)<\/corp_name>\s*<stock_code>([^<]*)<\/stock_code>/g;
 
   let m;
   while ((m = re.exec(xml)) !== null) {
+    if (Date.now() - started > timeBudgetMs) break; // 시간 예산 초과 시 중단(크래시 방지)
+
     const corp_name = (m[1] || "").trim();
     const stock_code = (m[2] || "").trim();
-    if (!corp_name) continue;
-    if (!stock_code) continue;
-    if (stock_code.length !== 6) continue;
 
-    set.add(normName(corp_name));
+    if (!stock_code || stock_code.length !== 6) continue;
+
+    const nn = normName(corp_name);
+    if (remaining.has(nn)) {
+      listedFound.add(nn);
+      remaining.delete(nn);
+      if (remaining.size === 0) break; // 다 찾으면 즉시 종료
+    }
   }
 
-  listedNameSetCache = set;
-  listedNameSetLoadedAt = Date.now();
-  return set;
+  return { listedFound, partial: remaining.size > 0 };
 }
 
-// ---------- DART 달력 HTML ----------
+// ---------- DART 달력 ----------
 async function fetchDartCalendarHtml(year, month) {
   const y = String(year);
   const m = pad2(month);
@@ -277,7 +288,6 @@ function htmlToLines(html) {
     .filter(Boolean);
 }
 
-// ---------- 달력 파싱 (코/유/넥/기 단독 라인 + 회사명[시작/종료] 라인 지원) ----------
 function parseCalendarItems(lines, year, month) {
   const y = String(year);
   const m = pad2(month);
@@ -309,11 +319,10 @@ function parseCalendarItems(lines, year, month) {
           market: marketLong(ms),
           sbd_start: date,
           sbd_end: date,
-          end_seen: false, // 종료를 실제로 봤는지
+          end_seen: false,
         });
       } else {
-        const it = itemsMap.get(key);
-        it.sbd_start = date;
+        itemsMap.get(key).sbd_start = date;
       }
     } else {
       const start = startMap.get(key) || date;
@@ -378,7 +387,7 @@ exports.handler = async (event) => {
     const qs = event.queryStringParameters || {};
     const year = qs.year || "2026";
     const month = qs.month || "01";
-    const mode = (qs.mode || "ipo").toLowerCase(); // 앱은 그대로 mode=ipo 호출하면 됨
+    const mode = (qs.mode || "ipo").toLowerCase();
     const debug = String(qs.debug || "") === "1";
 
     const html = await fetchDartCalendarHtml(year, month);
@@ -395,21 +404,24 @@ exports.handler = async (event) => {
       if (!key) {
         note = "OPENDART_KEY 미설정이라 상장사(유상증자 등) 필터를 못 했어요.";
       } else {
-        const listedSet = await loadListedNameSet(key);
+        const targetNormSet = new Set(allItems.map((it) => normName(it.corp_name)));
+        const { listedFound, partial } = await findListedTargets(key, targetNormSet, 12000);
 
-        // 1) 상장사 제거
-        const tmp = [];
-        for (const it of items) {
-          const nn = normName(it.corp_name);
-          if (listedSet.has(nn)) {
-            filtered_listed++;
-            continue;
-          }
-          tmp.push(it);
+        if (partial) {
+          note = "상장사 필터가 시간 예산 때문에 일부만 적용됐어요(그래도 크래시는 안 나게 함). 새로고침 후 다시 시도하면 더 잘 걸러집니다.";
         }
-        items = tmp;
 
-        // 2) ETC(기) 잡음 제거: 종료 없거나(시작만) / 하루짜리 제거
+        // 1) 상장사 제거 (대한광통신 같은 애들 여기서 빠짐)
+        items = items.filter((it) => {
+          const nn = normName(it.corp_name);
+          if (listedFound.has(nn)) {
+            filtered_listed++;
+            return false;
+          }
+          return true;
+        });
+
+        // 2) ETC(기) 잡음 제거: 종료가 없거나 / 하루짜리(시작=종료) 제거
         items = items.filter((it) => {
           if (it.market_short !== "기") return true;
           if (!it.end_seen) { filtered_etc_noise++; return false; }
