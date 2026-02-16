@@ -1,22 +1,25 @@
-const LS_KEY = "ipo_reminder_v1";
+/* 공모 알림 (4인가족) - app.js
+   기능:
+   - 일정 추가/삭제
+   - 가족 추가/이름변경/삭제
+   - 가족별 체크리스트(예수금 확인 / 청약 완료)
+   - .ics 내보내기(관심/전체)
+   - DART 청약달력 원클릭 가져오기 (/api/dart-ipo or /.netlify/functions/dart-ipo)
+*/
 
-const $ = (sel) => document.querySelector(sel);
-const $$ = (sel) => document.querySelectorAll(sel);
+const LS_KEY = "ipo4_store_v3";
 
 function uid() {
-  return (crypto?.randomUUID?.() ?? "id-" + Math.random().toString(16).slice(2));
+  return (crypto?.randomUUID?.() ?? ("id-" + Math.random().toString(16).slice(2)));
 }
-
 function loadStore() {
   const raw = localStorage.getItem(LS_KEY);
   if (!raw) return null;
   try { return JSON.parse(raw); } catch { return null; }
 }
-
-function saveStore(store) {
-  localStorage.setItem(LS_KEY, JSON.stringify(store));
+function saveStore(s) {
+  localStorage.setItem(LS_KEY, JSON.stringify(s));
 }
-
 function defaultStore() {
   const members = [
     { id: uid(), name: "아빠", brokerNote: "" },
@@ -26,463 +29,334 @@ function defaultStore() {
   ];
   return { members, events: [] };
 }
-
-let store = loadStore() ?? defaultStore();
-// (옵션) 콘솔에서도 store를 보고 싶으면 이 줄 추가
-// window.store = store;
-
-document.addEventListener("DOMContentLoaded", () => {
-  const btn = document.getElementById("import-dart");
-  const status = document.getElementById("import-status");
-  if (!btn) return;
-
-  btn.addEventListener("click", async () => {
-    try {
-      btn.disabled = true;
-      if (status) status.textContent = "DART에서 불러오는 중…";
-
-      const now = new Date();
-      const year = String(now.getFullYear());
-      const month = String(now.getMonth() + 1).padStart(2, "0");
-
-      // redirects가 되면 /api/... 가 먹고, 안 되면 functions로 자동 대체
-      let res = await fetch(`/api/dart-ipo?year=${year}&month=${month}`);
-      if (!res.ok) {
-        res = await fetch(`/.netlify/functions/dart-ipo?year=${year}&month=${month}`);
-      }
-
-      const data = await res.json();
-      if (!data.ok) throw new Error(data.error || "가져오기 실패");
-
-      // 중복 방지 (회사+시작+종료)
-      const existing = new Set(
-        (store.events || []).map(e =>
-          `${e.companyName || e.title || e.name || ""}|${e.startDate || e.start || ""}|${e.endDate || e.end || ""}`
-        )
-      );
-
-      let added = 0;
-
-      for (const it of (data.items || [])) {
-        const company = it.corp_name;
-        const start = it.sbd_start;
-        const end = it.sbd_end;
-
-        const dupKey = `${company}|${start}|${end}`;
-        if (existing.has(dupKey)) continue;
-
-        // 네 앱 필드명이 뭔지 몰라도 되게 여러 키를 같이 넣음
-        const ev = {
-          id: uid(),
-          companyName: company,
-          title: `${company} 청약 (${it.market_short})`,
-          name: company,
-
-          startDate: start,
-          endDate: end,
-          start: start,
-          end: end,
-
-          memo: `출처: DART 청약달력 (${it.market_short})`,
-          note: `출처: DART 청약달력 (${it.market_short})`,
-
-          perMember: {}
-        };
-
-        store.events.push(ev);
-        existing.add(dupKey);
-        added++;
-      }
-
-      saveStore(store);
-      renderAll();
-
-      if (status) status.textContent = `완료! ${added}개 추가됨 (${year}-${month})`;
-    } catch (e) {
-      console.error(e);
-      if (status) status.textContent = `실패: ${e.message || e}`;
-      alert(`DART 가져오기 실패: ${e.message || e}`);
-    } finally {
-      btn.disabled = false;
-    }
-  });
-});
-
-saveStore(store);
-
-// ---------- Tabs ----------
-$$(".tab").forEach(btn => {
-  btn.addEventListener("click", () => {
-    $$(".tab").forEach(b => b.classList.remove("active"));
-    btn.classList.add("active");
-
-    $$(".panel").forEach(p => p.classList.remove("active"));
-    $("#tab-" + btn.dataset.tab).classList.add("active");
-  });
-});
-
-// ---------- Render ----------
-function fmtDate(yyyy_mm_dd) {
-  return yyyy_mm_dd;
+function esc(s) {
+  return String(s ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
 }
-
-function ensureChecklists(event) {
-  event.perMember ??= {};
-  for (const m of store.members) {
-    if (!event.perMember[m.id]) {
-      event.perMember[m.id] = { cashChecked: false, applied: false };
+function ymdToDate(ymd) {
+  // "YYYY-MM-DD"
+  const [y, m, d] = (ymd || "").split("-").map(n => parseInt(n, 10));
+  if (!y || !m || !d) return null;
+  return new Date(y, m - 1, d);
+}
+function dateToYMD(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+function ensureEventPerMember(ev, members) {
+  ev.perMember = ev.perMember || {};
+  for (const m of members) {
+    if (!ev.perMember[m.id]) {
+      ev.perMember[m.id] = {
+        funded: false,   // 예수금 확인
+        applied: false,  // 청약 완료
+      };
+    } else {
+      ev.perMember[m.id].funded = !!ev.perMember[m.id].funded;
+      ev.perMember[m.id].applied = !!ev.perMember[m.id].applied;
     }
   }
 }
-
-function renderFamily() {
-  const box = $("#family-list");
-  box.innerHTML = "";
-
-  store.members.forEach(m => {
-    const el = document.createElement("div");
-    el.className = "item";
-    el.innerHTML = `
-      <div class="left">
-        <div><b>${escapeHtml(m.name)}</b></div>
-        ${m.brokerNote ? `<div class="muted">${escapeHtml(m.brokerNote)}</div>` : `<div class="muted">증권사 메모 없음</div>`}
-      </div>
-      <div class="actions">
-        <button class="small-btn" data-act="rename" data-id="${m.id}">이름수정</button>
-        <button class="small-btn danger" data-act="del" data-id="${m.id}">삭제</button>
-      </div>
-    `;
-    box.appendChild(el);
-  });
-
-  box.querySelectorAll("button").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const id = btn.dataset.id;
-      const act = btn.dataset.act;
-      if (act === "del") {
-        store.members = store.members.filter(x => x.id !== id);
-        // 이벤트 체크리스트에서도 제거
-        store.events.forEach(e => { if (e.perMember) delete e.perMember[id]; });
-        saveStore(store);
-        renderAll();
-      } else if (act === "rename") {
-        const m = store.members.find(x => x.id === id);
-        if (!m) return;
-        const newName = prompt("이름", m.name);
-        if (newName && newName.trim()) {
-          m.name = newName.trim();
-          saveStore(store);
-          renderAll();
-        }
-      }
-    });
-  });
+function normalizeEvent(ev) {
+  // 필드 안전장치
+  ev.companyName = String(ev.companyName || "").trim();
+  ev.startDate = String(ev.startDate || "");
+  ev.endDate = String(ev.endDate || "");
+  ev.underwriters = String(ev.underwriters || "");
+  ev.memo = String(ev.memo || "");
+  ev.starred = !!ev.starred;
+  ev.perMember = ev.perMember || {};
+  return ev;
 }
 
-function renderEvents() {
-  const box = $("#events-list");
-  box.innerHTML = "";
+// store 초기화
+let store = loadStore() || defaultStore();
+store.members = store.members || [];
+store.events = (store.events || []).map(normalizeEvent);
 
-  const events = [...store.events].sort((a,b) => (a.startDate > b.startDate ? 1 : -1));
+// 개발자도구에서 보고 싶으면 콘솔에서 window.store 확인 가능
+window.store = store;
 
-  events.forEach(e => {
-    ensureChecklists(e);
+// DOM refs
+const $ = (sel) => document.querySelector(sel);
+const tabs = document.querySelectorAll(".tab");
+const panels = document.querySelectorAll(".panel");
 
-    const el = document.createElement("div");
-    el.className = "item";
-    el.innerHTML = `
-      <div class="left">
-        <div><b>${escapeHtml(e.companyName)}</b> ${e.starred ? "⭐" : ""}</div>
-        <div class="badge">청약 ${fmtDate(e.startDate)} ~ ${fmtDate(e.endDate)}</div>
-        ${e.underwriters ? `<div class="muted">주간사: ${escapeHtml(e.underwriters)}</div>` : ""}
-        ${e.memo ? `<div class="muted">메모: ${escapeHtml(e.memo)}</div>` : ""}
-      </div>
-      <div class="actions">
-        <button class="small-btn" data-act="detail" data-id="${e.id}">상세/체크</button>
-        <button class="small-btn" data-act="star" data-id="${e.id}">${e.starred ? "관심해제" : "관심"}</button>
-        <button class="small-btn danger" data-act="del" data-id="${e.id}">삭제</button>
-      </div>
-    `;
-    box.appendChild(el);
-  });
+const eventForm = $("#event-form");
+const eventsList = $("#events-list");
 
-  if (!events.length) {
-    const empty = document.createElement("div");
-    empty.className = "muted";
-    empty.textContent = "아직 일정이 없어요. 위에서 하나 추가해봐!";
-    box.appendChild(empty);
-  }
+const familyForm = $("#family-form");
+const familyList = $("#family-list");
 
-  box.querySelectorAll("button").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const id = btn.dataset.id;
-      const act = btn.dataset.act;
-      const e = store.events.find(x => x.id === id);
-      if (!e) return;
+const exportStarredBtn = $("#export-starred");
+const exportAllBtn = $("#export-all");
+const calNameInput = $("#calName");
 
-      if (act === "del") {
-        store.events = store.events.filter(x => x.id !== id);
-        saveStore(store);
-        renderAll();
-      } else if (act === "star") {
-        e.starred = !e.starred;
-        saveStore(store);
-        renderAll();
-      } else if (act === "detail") {
-        openEventModal(e);
-      }
-    });
-  });
+const dartYear = $("#dart-year");
+const dartMonth = $("#dart-month");
+const dartBtn = $("#import-dart");
+const dartStatus = $("#import-status");
+
+// 초기: 년/월 기본값 세팅
+(function initDartInputs() {
+  const now = new Date();
+  if (dartYear) dartYear.value = String(now.getFullYear());
+  if (dartMonth) dartMonth.value = String(now.getMonth() + 1);
+})();
+
+// 탭 전환
+function setActiveTab(tabName) {
+  tabs.forEach(b => b.classList.toggle("active", b.dataset.tab === tabName));
+  panels.forEach(p => p.classList.toggle("active", p.id === `tab-${tabName}`));
 }
+tabs.forEach(b => b.addEventListener("click", () => setActiveTab(b.dataset.tab)));
 
+// 렌더
 function renderAll() {
-  // normalize
-  store.events.forEach(ensureChecklists);
-  saveStore(store);
+  // 모든 이벤트에 멤버 체크리스트 보정
+  for (const ev of store.events) ensureEventPerMember(ev, store.members);
 
-  renderFamily();
   renderEvents();
+  renderFamily();
+}
+function renderEvents() {
+  const arr = [...store.events].sort((a, b) => {
+    const da = a.startDate || "9999-99-99";
+    const db = b.startDate || "9999-99-99";
+    if (da !== db) return da.localeCompare(db);
+    return (a.companyName || "").localeCompare(b.companyName || "");
+  });
+
+  if (!arr.length) {
+    eventsList.innerHTML = `<div class="muted">등록된 일정이 없어요.</div>`;
+    return;
+  }
+
+  eventsList.innerHTML = arr.map(ev => {
+    const star = ev.starred ? "⭐" : "☆";
+    const range = `${esc(ev.startDate)} ~ ${esc(ev.endDate)}`;
+    const uw = ev.underwriters ? `<div class="muted">주간사: ${esc(ev.underwriters)}</div>` : "";
+    const memo = ev.memo ? `<div class="muted">메모: ${esc(ev.memo)}</div>` : "";
+
+    const membersHtml = store.members.map(m => {
+      const st = ev.perMember?.[m.id] || { funded: false, applied: false };
+      return `
+        <div class="row space" style="align-items:center;">
+          <div>
+            <b>${esc(m.name)}</b>
+            ${m.brokerNote ? `<small class="muted">(${esc(m.brokerNote)})</small>` : ""}
+          </div>
+          <div class="row" style="gap:10px;">
+            <label class="inline">
+              <input type="checkbox" data-act="chk" data-eid="${esc(ev.id)}" data-mid="${esc(m.id)}" data-key="funded" ${st.funded ? "checked" : ""} />
+              예수금
+            </label>
+            <label class="inline">
+              <input type="checkbox" data-act="chk" data-eid="${esc(ev.id)}" data-mid="${esc(m.id)}" data-key="applied" ${st.applied ? "checked" : ""} />
+              청약완료
+            </label>
+          </div>
+        </div>
+      `;
+    }).join("");
+
+    return `
+      <div class="item" data-eid="${esc(ev.id)}">
+        <div class="row space">
+          <div>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <button class="icon-btn" type="button" data-act="star" data-eid="${esc(ev.id)}" aria-label="star">${star}</button>
+              <b>${esc(ev.companyName)}</b>
+              <small class="muted">${range}</small>
+            </div>
+            ${uw}
+            ${memo}
+          </div>
+          <div class="row" style="gap:8px;">
+            <button class="btn" type="button" data-act="del" data-eid="${esc(ev.id)}">삭제</button>
+          </div>
+        </div>
+
+        <div class="muted" style="margin-top:10px; font-weight:600;">가족 체크</div>
+        <div class="list" style="margin-top:6px;">
+          ${membersHtml}
+        </div>
+      </div>
+    `;
+  }).join("");
+}
+function renderFamily() {
+  if (!store.members.length) {
+    familyList.innerHTML = `<div class="muted">가족이 없어요. 추가해 주세요.</div>`;
+    return;
+  }
+
+  familyList.innerHTML = store.members.map(m => {
+    return `
+      <div class="item">
+        <div class="row space">
+          <div>
+            <b>${esc(m.name)}</b>
+            ${m.brokerNote ? `<div class="muted">${esc(m.brokerNote)}</div>` : `<div class="muted">메모 없음</div>`}
+          </div>
+          <div class="row" style="gap:8px;">
+            <button class="btn" type="button" data-act="rename-member" data-id="${esc(m.id)}">이름변경</button>
+            <button class="btn" type="button" data-act="del-member" data-id="${esc(m.id)}">삭제</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join("");
 }
 
-renderAll();
+// 이벤트 추가(수동)
+eventForm?.addEventListener("submit", (e) => {
+  e.preventDefault();
 
-// ---------- Forms ----------
-$("#family-form").addEventListener("submit", (ev) => {
-  ev.preventDefault();
-  const name = $("#memberName").value.trim();
-  const brokerNote = $("#brokerNote").value.trim();
-  if (!name) return;
-
-  store.members.push({ id: uid(), name, brokerNote });
-  // 기존 이벤트 체크리스트 슬롯 생성
-  store.events.forEach(ensureChecklists);
-
-  saveStore(store);
-  $("#memberName").value = "";
-  $("#brokerNote").value = "";
-  renderAll();
-});
-
-$("#event-form").addEventListener("submit", (ev) => {
-  ev.preventDefault();
   const companyName = $("#companyName").value.trim();
   const startDate = $("#startDate").value;
   const endDate = $("#endDate").value;
+  const underwriters = $("#underwriters").value.trim();
+  const memo = $("#memo").value.trim();
+  const starred = $("#starred").checked;
+
   if (!companyName || !startDate || !endDate) return;
 
-  const event = {
+  const ev = normalizeEvent({
     id: uid(),
     companyName,
     startDate,
     endDate,
-    underwriters: $("#underwriters").value.trim(),
-    memo: $("#memo").value.trim(),
-    starred: $("#starred").checked,
+    underwriters,
+    memo,
+    starred,
     perMember: {}
-  };
-  ensureChecklists(event);
-  store.events.push(event);
-  saveStore(store);
+  });
+  ensureEventPerMember(ev, store.members);
 
-  ev.target.reset();
-  $("#starred").checked = true;
+  store.events.push(ev);
+  saveStore(store);
   renderAll();
+
+  eventForm.reset();
+  $("#starred").checked = true;
 });
 
-// ---------- Modal (detail/checklist) ----------
-const modal = $("#modal");
-$("#modal-close").addEventListener("click", closeModal);
-modal.addEventListener("click", (e) => { if (e.target === modal) closeModal(); });
+// events 클릭 핸들링(삭제/별/체크)
+eventsList?.addEventListener("click", (e) => {
+  const btn = e.target.closest("button");
+  if (!btn) return;
 
-function closeModal() {
-  modal.classList.add("hidden");
-  modal.setAttribute("aria-hidden", "true");
-  $("#modal-body").innerHTML = "";
-}
+  const act = btn.dataset.act;
+  const eid = btn.dataset.eid;
+  if (!act || !eid) return;
 
-function openEventModal(event) {
-  $("#modal-title").textContent = event.companyName;
-  const body = $("#modal-body");
-  body.innerHTML = `
-    <div class="muted">청약 ${event.startDate} ~ ${event.endDate}</div>
-    <div class="hr"></div>
-    <div class="muted">가족 체크리스트</div>
-    <div id="checklist"></div>
-  `;
+  const ev = store.events.find(x => x.id === eid);
+  if (!ev) return;
 
-  const list = body.querySelector("#checklist");
-  list.innerHTML = "";
+  if (act === "del") {
+    if (!confirm("이 일정을 삭제할까요?")) return;
+    store.events = store.events.filter(x => x.id !== eid);
+    saveStore(store);
+    renderAll();
+  } else if (act === "star") {
+    ev.starred = !ev.starred;
+    saveStore(store);
+    renderAll();
+  }
+});
 
-  store.members.forEach(m => {
-    const s = event.perMember?.[m.id] ?? { cashChecked:false, applied:false };
+// 체크박스 변경 핸들링
+eventsList?.addEventListener("change", (e) => {
+  const input = e.target;
+  if (!(input instanceof HTMLInputElement)) return;
+  if (input.dataset.act !== "chk") return;
 
-    const row = document.createElement("div");
-    row.className = "item";
-    row.innerHTML = `
-      <div class="left">
-        <div><b>${escapeHtml(m.name)}</b></div>
-        ${m.brokerNote ? `<div class="muted">${escapeHtml(m.brokerNote)}</div>` : ""}
-        <div class="checkbox-row">
-          <label class="inline">
-            <input type="checkbox" data-k="cashChecked" ${s.cashChecked ? "checked":""}/>
-            예수금 확인
-          </label>
-          <label class="inline">
-            <input type="checkbox" data-k="applied" ${s.applied ? "checked":""}/>
-            청약 완료
-          </label>
-        </div>
-      </div>
-    `;
+  const eid = input.dataset.eid;
+  const mid = input.dataset.mid;
+  const key = input.dataset.key;
+  if (!eid || !mid || !key) return;
 
-    row.querySelectorAll("input[type=checkbox]").forEach(cb => {
-      cb.addEventListener("change", () => {
-        const k = cb.dataset.k;
-        event.perMember[m.id][k] = cb.checked;
-        saveStore(store);
-        renderEvents(); // list 반영
-      });
-    });
+  const ev = store.events.find(x => x.id === eid);
+  if (!ev) return;
 
-    list.appendChild(row);
-  });
+  ev.perMember = ev.perMember || {};
+  ev.perMember[mid] = ev.perMember[mid] || { funded: false, applied: false };
+  ev.perMember[mid][key] = input.checked;
 
-  modal.classList.remove("hidden");
-  modal.setAttribute("aria-hidden", "false");
-}
+  saveStore(store);
+});
 
-// ---------- ICS Export ----------
-$("#export-starred").addEventListener("click", () => exportICS(true));
-$("#export-all").addEventListener("click", () => exportICS(false));
+// 가족 추가
+familyForm?.addEventListener("submit", (e) => {
+  e.preventDefault();
+  const name = $("#memberName").value.trim();
+  const brokerNote = $("#brokerNote").value.trim();
+  if (!name) return;
 
-function exportICS(onlyStarred) {
-  const calName = ($("#calName").value || "공모 알림").trim();
-  const selected = store.events.filter(e => onlyStarred ? e.starred : true);
-  if (!selected.length) {
-    alert("내보낼 일정이 없어요.");
-    return;
+  const m = { id: uid(), name, brokerNote };
+  store.members.push(m);
+
+  // 모든 이벤트에 체크리스트 추가
+  store.events.forEach(ev => ensureEventPerMember(ev, store.members));
+
+  saveStore(store);
+  renderAll();
+  familyForm.reset();
+});
+
+// 가족 리스트 액션
+familyList?.addEventListener("click", (e) => {
+  const btn = e.target.closest("button");
+  if (!btn) return;
+
+  const act = btn.dataset.act;
+  const id = btn.dataset.id;
+  if (!act || !id) return;
+
+  if (act === "del-member") {
+    const m = store.members.find(x => x.id === id);
+    if (!m) return;
+    if (!confirm(`${m.name} 삭제할까요? (모든 일정의 체크도 같이 삭제됨)`)) return;
+
+    store.members = store.members.filter(x => x.id !== id);
+    store.events.forEach(ev => { if (ev.perMember) delete ev.perMember[id]; });
+
+    saveStore(store);
+    renderAll();
   }
 
-  const ics = buildICS(calName, selected);
-  downloadText(`${calName.replace(/\s+/g,'_')}.ics`, ics, "text/calendar;charset=utf-8");
-}
-
-function buildICS(calName, events) {
-  const now = new Date();
-  const dtstamp = toICSUTC(now);
-
-  const lines = [];
-  lines.push("BEGIN:VCALENDAR");
-  lines.push("VERSION:2.0");
-  lines.push("PRODID:-//IPO Reminder//KO//EN");
-  lines.push("CALSCALE:GREGORIAN");
-  lines.push(`X-WR-CALNAME:${escapeICS(calName)}`);
-  lines.push("X-WR-TIMEZONE:Asia/Seoul");
-
-  for (const e of events) {
-    // 1) 기간 표시(올데이)
-    lines.push(...eventAllDayBlock(e, dtstamp));
-
-    // 2) 알림용 3개 이벤트(각 1개 VALARM)
-    lines.push(...reminderEventBlock(e, dtstamp, "dminus1", "청약 D-1", "내일 청약 시작", minusDaysAt(e.startDate, 1, 21, 0)));
-    lines.push(...reminderEventBlock(e, dtstamp, "dday_am", "청약 시작", "오늘 청약 시작", atTime(e.startDate, 8, 30)));
-    lines.push(...reminderEventBlock(e, dtstamp, "dday_pm", "마감 임박", "오늘 청약 마감 임박", atTime(e.endDate, 14, 50)));
+  if (act === "rename-member") {
+    const m = store.members.find(x => x.id === id);
+    if (!m) return;
+    const newName = prompt("이름", m.name);
+    if (newName && newName.trim()) {
+      m.name = newName.trim();
+      saveStore(store);
+      renderAll();
+    }
   }
+});
 
-  lines.push("END:VCALENDAR");
-  return lines.join("\r\n");
+// ICS 생성
+function icsEscape(s) {
+  return String(s ?? "")
+    .replaceAll("\\", "\\\\")
+    .replaceAll("\n", "\\n")
+    .replaceAll(",", "\\,")
+    .replaceAll(";", "\\;");
 }
-
-function eventAllDayBlock(e, dtstamp) {
-  const uidBase = `${e.id}-period@iporeminder.local`;
-  const start = toICSDate(e.startDate);
-  const endExclusive = toICSDate(addDays(e.endDate, 1)); // 올데이 DTEND는 다음날
-  const summary = `청약 기간: ${e.companyName}`;
-  const desc = [
-    e.underwriters ? `주간사/증권사: ${e.underwriters}` : "",
-    e.memo ? `메모: ${e.memo}` : "",
-    "※ 최종 일정은 공식 공지로 확인"
-  ].filter(Boolean).join("\\n");
-
-  return [
-    "BEGIN:VEVENT",
-    `UID:${uidBase}`,
-    `DTSTAMP:${dtstamp}`,
-    `SUMMARY:${escapeICS(summary)}`,
-    `DESCRIPTION:${escapeICS(desc)}`,
-    `DTSTART;VALUE=DATE:${start}`,
-    `DTEND;VALUE=DATE:${endExclusive}`,
-    "END:VEVENT"
-  ];
+function toIcsDate(ymd) {
+  // all-day: YYYYMMDD
+  return String(ymd).replaceAll("-", "");
 }
-
-function reminderEventBlock(e, dtstamp, kind, titlePrefix, bodyPrefix, dateObj) {
-  // dateObj는 JS Date(로컬) -> Asia/Seoul로 '표시용' 생성
-  const uidBase = `${e.id}-${kind}@iporeminder.local`;
-  const start = toICSLocalSeoul(dateObj);
-  const summary = `${titlePrefix}: ${e.companyName}`;
-  const desc = [
-    `${bodyPrefix} — ${e.companyName}`,
-    e.underwriters ? `주간사/증권사: ${e.underwriters}` : "",
-    e.memo ? `메모: ${e.memo}` : "",
-    "체크리스트: 가족별 예수금 확인/청약 완료"
-  ].filter(Boolean).join("\\n");
-
-  return [
-    "BEGIN:VEVENT",
-    `UID:${uidBase}`,
-    `DTSTAMP:${dtstamp}`,
-    `SUMMARY:${escapeICS(summary)}`,
-    `DESCRIPTION:${escapeICS(desc)}`,
-    `DTSTART;TZID=Asia/Seoul:${start}`,
-    `DURATION:PT5M`,
-    "BEGIN:VALARM",
-    "ACTION:DISPLAY",
-    `DESCRIPTION:${escapeICS(summary)}`,
-    "TRIGGER:-PT0M",
-    "END:VALARM",
-    "END:VEVENT"
-  ];
-}
-
-// ---------- Date helpers ----------
-function atTime(yyyy_mm_dd, hh, mm) {
-  const d = new Date(`${yyyy_mm_dd}T00:00:00`);
-  d.setHours(hh, mm, 0, 0);
-  return d;
-}
-
-function minusDaysAt(yyyy_mm_dd, days, hh, mm) {
-  const d = atTime(yyyy_mm_dd, hh, mm);
-  d.setDate(d.getDate() - days);
-  return d;
-}
-
-function addDays(yyyy_mm_dd, add) {
-  const d = new Date(`${yyyy_mm_dd}T00:00:00`);
-  d.setDate(d.getDate() + add);
-  return d.toISOString().slice(0,10);
-}
-
-function toICSDate(yyyy_mm_dd) {
-  return yyyy_mm_dd.replaceAll("-", "");
-}
-
-function toICSUTC(d) {
-  // YYYYMMDDTHHMMSSZ
-  const pad = (n) => String(n).padStart(2,"0");
-  return `${d.getUTCFullYear()}${pad(d.getUTCMonth()+1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
-}
-
-function toICSLocalSeoul(d) {
-  // 로컬 시간을 그대로 YYYYMMDDTHHMMSS 로 출력 (TZID=Asia/Seoul 사용)
-  const pad = (n) => String(n).padStart(2,"0");
-  return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}T${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
-}
-
-// ---------- Utils ----------
-function downloadText(filename, text, mime) {
-  const blob = new Blob([text], { type: mime });
+function downloadText(filename, text) {
+  const blob = new Blob([text], { type: "text/calendar;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -490,209 +364,132 @@ function downloadText(filename, text, mime) {
   document.body.appendChild(a);
   a.click();
   a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 3000);
+  URL.revokeObjectURL(url);
+}
+function buildIcs(events, calName) {
+  const dtstamp = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15) + "Z";
+
+  const lines = [];
+  lines.push("BEGIN:VCALENDAR");
+  lines.push("VERSION:2.0");
+  lines.push("PRODID:-//ipo4//calendar//KO");
+  lines.push("CALSCALE:GREGORIAN");
+  lines.push(`X-WR-CALNAME:${icsEscape(calName || "공모 알림")}`);
+
+  for (const ev of events) {
+    const start = ymdToDate(ev.startDate);
+    const end = ymdToDate(ev.endDate);
+    if (!start || !end) continue;
+
+    // all-day 이벤트는 DTEND가 "다음날"이어야 함
+    const dtStart = toIcsDate(ev.startDate);
+    const endPlus = new Date(end.getFullYear(), end.getMonth(), end.getDate() + 1);
+    const dtEnd = toIcsDate(dateToYMD(endPlus));
+
+    const summary = `${ev.companyName} 청약`;
+    const descParts = [];
+    if (ev.underwriters) descParts.push(`주간사: ${ev.underwriters}`);
+    if (ev.memo) descParts.push(`메모: ${ev.memo}`);
+    const desc = descParts.join("\\n");
+
+    lines.push("BEGIN:VEVENT");
+    lines.push(`UID:${icsEscape(ev.id)}@ipo4`);
+    lines.push(`DTSTAMP:${dtstamp}`);
+    lines.push(`SUMMARY:${icsEscape(summary)}`);
+    lines.push(`DTSTART;VALUE=DATE:${dtStart}`);
+    lines.push(`DTEND;VALUE=DATE:${dtEnd}`);
+    if (desc) lines.push(`DESCRIPTION:${icsEscape(desc)}`);
+    lines.push("END:VEVENT");
+  }
+
+  lines.push("END:VCALENDAR");
+  return lines.join("\r\n");
 }
 
-function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, (m) => ({
-    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
-  }[m]));
+exportStarredBtn?.addEventListener("click", () => {
+  const calName = calNameInput?.value?.trim() || "공모 알림";
+  const events = store.events.filter(e => e.starred);
+  const ics = buildIcs(events, calName);
+  downloadText("ipo-starred.ics", ics);
+});
+
+exportAllBtn?.addEventListener("click", () => {
+  const calName = calNameInput?.value?.trim() || "공모 알림";
+  const ics = buildIcs(store.events, calName);
+  downloadText("ipo-all.ics", ics);
+});
+
+// DART 원클릭 가져오기
+async function fetchDartIpo(year, month) {
+  const y = encodeURIComponent(String(year));
+  const m = encodeURIComponent(String(month).padStart(2, "0"));
+
+  // 1) 짧은 주소 먼저
+  let res = await fetch(`/api/dart-ipo?year=${y}&month=${m}`);
+  if (res.ok) return await res.json();
+
+  // 2) fallback (redirects가 아직이면)
+  res = await fetch(`/.netlify/functions/dart-ipo?year=${y}&month=${m}`);
+  return await res.json();
 }
 
-function escapeICS(s) {
-  return String(s)
-    .replaceAll("\\", "\\\\")
-    .replaceAll("\n", "\\n")
-    .replaceAll(",", "\\,")
-    .replaceAll(";", "\\;");
-}
-document.querySelector("#import-dart")?.addEventListener("click", async () => {
-  const year = String(document.querySelector("#dart-year")?.value || "").trim();
-  const month = String(document.querySelector("#dart-month")?.value || "").trim().padStart(2, "0");
-  const statusEl = document.querySelector("#dart-status");
-
+dartBtn?.addEventListener("click", async () => {
   try {
-    if (statusEl) statusEl.textContent = "가져오는 중…";
+    dartBtn.disabled = true;
+    if (dartStatus) dartStatus.textContent = "불러오는 중…";
 
-    // _redirects 안 썼으면 아래 줄을 이걸로 바꿔:
-    // const r = await fetch(`/.netlify/functions/dart-ipo?year=${year}&month=${month}`);
-    const r = await fetch(`/api/dart-ipo?year=${year}&month=${month}`);
+    const year = parseInt(dartYear?.value || "", 10);
+    const month = parseInt(dartMonth?.value || "", 10);
+    if (!year || !month || month < 1 || month > 12) {
+      throw new Error("Year/Month를 확인해 주세요.");
+    }
 
-    const data = await r.json();
-    if (!data.ok) throw new Error(data.error || "import failed");
+    const data = await fetchDartIpo(year, month);
+    if (!data.ok) throw new Error(data.error || "DART 가져오기 실패");
 
-    const existingKey = new Set((store.events || []).map(e => `${e.companyName}|${e.startDate}`));
+    const existing = new Set(
+      (store.events || []).map(e => `${e.companyName}|${e.startDate}|${e.endDate}`)
+    );
+
     let added = 0;
+    for (const it of (data.items || [])) {
+      const companyName = String(it.corp_name || "").trim();
+      const startDate = it.sbd_start;
+      const endDate = it.sbd_end;
+      if (!companyName || !startDate || !endDate) continue;
 
-    for (const it of data.items || []) {
-      const key = `${it.companyName}|${it.startDate}`;
-      if (existingKey.has(key)) continue;
+      const key = `${companyName}|${startDate}|${endDate}`;
+      if (existing.has(key)) continue;
 
-      const memoParts = [];
-      if (it.payDate) memoParts.push(`납입: ${it.payDate}`);
-      if (it.underwriters) memoParts.push(`주관: ${it.underwriters}`);
-      if (it.dartViewerUrl) memoParts.push(`DART: ${it.dartViewerUrl}`);
-
-      const ev = {
+      const ev = normalizeEvent({
         id: uid(),
-        companyName: it.companyName,
-        startDate: it.startDate,
-        endDate: it.endDate,
-        underwriters: it.underwriters || "",
-        memo: memoParts.join(" | "),
+        companyName,
+        startDate,
+        endDate,
+        underwriters: "",
+        memo: `출처: DART 청약달력 (${it.market_short || ""})`,
         starred: true,
         perMember: {}
-      };
-
-      ensureChecklists(ev);
+      });
+      ensureEventPerMember(ev, store.members);
 
       store.events.push(ev);
-      existingKey.add(key);
+      existing.add(key);
       added++;
     }
 
     saveStore(store);
     renderAll();
 
-    if (statusEl) statusEl.textContent = `완료: ${added}개 추가됨`;
-  } catch (err) {
-    console.error(err);
-    if (statusEl) statusEl.textContent = `실패: ${err.message || err}`;
-    alert(`DART 가져오기 실패: ${err.message || err}`);
+    if (dartStatus) dartStatus.textContent = `완료! ${added}개 추가됨 (${year}-${String(month).padStart(2,"0")})`;
+  } catch (e) {
+    console.error(e);
+    if (dartStatus) dartStatus.textContent = `실패: ${e.message || e}`;
+    alert(`DART 가져오기 실패: ${e.message || e}`);
+  } finally {
+    dartBtn.disabled = false;
   }
 });
 
-document.addEventListener("DOMContentLoaded", () => {
-  const btn = document.getElementById("import-dart");
-  const status = document.getElementById("import-status");
-  if (!btn) return;
-
-  btn.addEventListener("click", async () => {
-    try {
-      btn.disabled = true;
-      if (status) status.textContent = "불러오는 중…";
-
-      // 원하는 년/월로 바꾸고 싶으면 여기만 수정
-      const year = "2026";
-      const month = "02";
-
-      const res = await fetch(`/api/dart-ipo?year=${year}&month=${month}`);
-      const data = await res.json();
-
-      if (!data.ok) throw new Error(data.error || "import failed");
-
-      // ✅ 너 앱이 store/events 구조일 때
-      window.store = window.store || { events: [] };
-
-      const existing = new Set((store.events || []).map(e => `${e.companyName}|${e.startDate}|${e.endDate}`));
-      let added = 0;
-
-      for (const it of data.items || []) {
-        const companyName = it.corp_name;
-        const startDate = it.sbd_start;
-        const endDate = it.sbd_end;
-
-        const key = `${companyName}|${startDate}|${endDate}`;
-        if (existing.has(key)) continue;
-
-        const ev = {
-          id: (typeof uid === "function") ? uid() : crypto.randomUUID(),
-          companyName,
-          startDate,
-          endDate,
-          market: it.market,
-          memo: `DART 청약달력 (${it.market_short})`,
-          starred: true,
-          perMember: {}
-        };
-
-        store.events.push(ev);
-        existing.add(key);
-        added++;
-      }
-
-      // 저장/리렌더 (너 앱에 함수가 있으면 사용)
-      if (typeof saveStore === "function") saveStore(store);
-      else localStorage.setItem("store", JSON.stringify(store));
-
-      if (typeof renderAll === "function") renderAll();
-
-      if (status) status.textContent = `완료! ${added}개 추가됨`;
-    } catch (e) {
-      console.error(e);
-      if (status) status.textContent = `실패: ${e.message || e}`;
-      alert(`가져오기 실패: ${e.message || e}`);
-    } finally {
-      btn.disabled = false;
-    }
-  });
-});
-
-// ===== DART 원클릭 가져오기 =====
-document.addEventListener("DOMContentLoaded", () => {
-  const btn = document.getElementById("import-dart");
-  const status = document.getElementById("import-status");
-  if (!btn) return;
-
-  btn.addEventListener("click", async () => {
-    try {
-      btn.disabled = true;
-      if (status) status.textContent = "DART에서 불러오는 중…";
-
-      // 1) 가져올 년/월 (기본: 이번 달)
-      const now = new Date();
-      const year = String(now.getFullYear());
-      const month = String(now.getMonth() + 1).padStart(2, "0");
-
-      // 2) API 호출 (redirects가 안 됐으면 아래 줄을 functions로 바꿔도 됨)
-      const res = await fetch(`/api/dart-ipo?year=${year}&month=${month}`);
-      // const res = await fetch(`/.netlify/functions/dart-ipo?year=${year}&month=${month}`);
-
-      const data = await res.json();
-      if (!data.ok) throw new Error(data.error || "가져오기 실패");
-
-      // 3) 중복 방지용 키
-      const existing = new Set(
-        (store.events || []).map(e => `${e.title}|${e.start}|${e.end}`)
-      );
-
-      let added = 0;
-
-      // 4) items -> store.events로 변환
-      for (const it of (data.items || [])) {
-        const title = `${it.corp_name} 청약 (${it.market_short})`;
-        const start = it.sbd_start; // "YYYY-MM-DD"
-        const end = it.sbd_end;
-
-        const key = `${title}|${start}|${end}`;
-        if (existing.has(key)) continue;
-
-        const ev = {
-          id: uid(),
-          title,
-          start,   // 네 앱이 쓰는 필드명이 startDate면 알려줘. 맞춰줄게.
-          end,
-          note: `출처: DART 청약달력`,
-          perMember: {} // 가족별 체크리스트 구조 유지
-        };
-
-        store.events.push(ev);
-        existing.add(key);
-        added++;
-      }
-
-      saveStore(store);
-      renderAll();
-
-      if (status) status.textContent = `완료! ${added}개 추가됨 (${year}-${month})`;
-      if (added === 0 && status) status.textContent += " (추가할 새 일정이 없거나 0건일 수 있음)";
-    } catch (e) {
-      console.error(e);
-      if (status) status.textContent = `실패: ${e.message || e}`;
-      alert(`DART 가져오기 실패: ${e.message || e}`);
-    } finally {
-      btn.disabled = false;
-    }
-  });
-});
-
+// 첫 렌더
+renderAll();
