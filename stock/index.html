@@ -3,16 +3,17 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>공모 알림</title>
+  <title>공모 알림 (4인가족)</title>
   <link rel="manifest" href="manifest.webmanifest">
   <meta name="theme-color" content="#111111" />
   <link rel="stylesheet" href="styles.css" />
 </head>
+
 <body>
   <header class="header">
     <div class="title">
       <h1>공모 알림</h1>
-      <p>가족 체크 + 캘린더(.ics) + 미리알림(단축어) + 자동 가져오기</p>
+      <p>가족 체크 + 캘린더(.ics) + 미리알림(공유) + 자동 가져오기</p>
     </div>
     <nav class="tabs">
       <button class="tab active" data-tab="events">일정</button>
@@ -26,25 +27,32 @@
     <section id="tab-events" class="panel active">
       <div class="card">
         <h2>자동 가져오기</h2>
-        <p class="muted">범위: <b>오늘 ~ 다음달 말</b> (공모주 청약 일정만)</p>
-
+        <p class="muted">
+          범위: <b>오늘 ~ 다음달 말</b> (이번달+다음달을 합쳐서 보여줘요)
+        </p>
         <div class="row">
-          <button id="import-ipo" type="button" class="btn primary">공모주 일정 자동 채우기</button>
-          <button id="reset-import" type="button" class="btn">가져온 일정 초기화</button>
+          <button id="import-dart" class="btn primary" type="button">DART에서 일정 자동 채우기</button>
+          <button id="reset-import" class="btn" type="button">가져온 일정 초기화</button>
         </div>
-
         <div id="import-status" class="muted" style="margin-top:10px;"></div>
         <small class="muted">
-          ※ “증권사/균등 최소금액”은 참고 데이터로 자동 추정/매칭됩니다. 최종 확정은 반드시 공지 확인.
+          * “증권사/균등 최소금액”은 보조 데이터(자동 추정)라 비어있을 수 있어요. 최종은 공시/증권사 공지로 확인.
         </small>
       </div>
 
       <div class="card">
         <div class="row space">
           <h2>공모주 일정</h2>
-          <small class="muted">회사명/기간/증권사/균등 최소금액이 캘린더(.ics)와 미리알림(단축어)에 함께 들어갑니다.</small>
+          <small class="muted">체크박스로 가족별 진행상태(준비/청약완료)를 관리하세요.</small>
         </div>
         <div id="events-list" class="list"></div>
+      </div>
+
+      <div class="card note">
+        <h3>주의</h3>
+        <p class="muted">
+          일정은 참고용입니다. 최종 일정/주간사/청약조건은 반드시 공시 및 증권사 공지로 확인하세요.
+        </p>
       </div>
     </section>
 
@@ -70,15 +78,7 @@
       <div class="card">
         <h2>가족 목록</h2>
         <div id="family-list" class="list"></div>
-        <small class="muted">기본 4명 자동 생성. 필요하면 이름만 바꿔도 OK.</small>
-      </div>
-
-      <div class="card note">
-        <h3>미리알림(단축어) 준비</h3>
-        <p class="muted">
-          아래 “미리알림” 버튼은 iOS 단축어를 실행합니다. 단축어 이름을 <b>공모주 미리알림 추가</b>로 만들어 주세요.
-          (만드는 방법은 app.js 코드 아래 안내 참고)
-        </p>
+        <small class="muted">기본으로 4명이 자동 생성돼요. 필요하면 이름만 바꿔도 OK.</small>
       </div>
     </section>
 
@@ -87,7 +87,8 @@
       <div class="card">
         <h2>캘린더(.ics) 내보내기</h2>
         <p class="muted">
-          아이폰에서 .ics 파일을 열면 Apple Calendar로 가져오기 됩니다.
+          아이폰에서 .ics 파일을 열면 Apple Calendar로 “가져오기”가 됩니다.
+          (알림은 캘린더 설정에 따라 울려요)
         </p>
 
         <div class="form">
@@ -97,12 +98,32 @@
           </label>
 
           <div class="row">
-            <button id="export-all" class="btn primary">전체 일정 .ics 다운로드</button>
+            <button id="export-upcoming" class="btn primary">오늘~다음달 일정 .ics 다운로드</button>
+            <button id="export-all" class="btn">저장된 전체 일정 .ics 다운로드</button>
           </div>
+
+          <details class="details">
+            <summary>미리알림(아이폰 기본앱)으로 넣는 방법</summary>
+            <ul class="muted">
+              <li>각 일정 카드의 <b>미리알림</b> 버튼을 누르면 iOS 공유창이 떠요.</li>
+              <li>거기서 <b>미리알림</b>을 선택하면 바로 추가할 수 있어요.</li>
+            </ul>
+          </details>
         </div>
       </div>
     </section>
   </main>
+
+  <!-- MODAL (간단히 유지) -->
+  <div id="modal" class="modal hidden" aria-hidden="true">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3 id="modal-title">상세</h3>
+        <button id="modal-close" class="icon-btn" aria-label="닫기">✕</button>
+      </div>
+      <div id="modal-body"></div>
+    </div>
+  </div>
 
   <script src="app.js"></script>
   <script>
