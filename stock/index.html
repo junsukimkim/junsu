@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>공모 알림 (4인가족)</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <meta name="theme-color" content="#111111" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="header">
+    <div class="title">
+      <h1>공모 알림</h1>
+      <p>가족 4인 체크 + 캘린더 알림(.ics)</p>
+    </div>
+    <nav class="tabs">
+      <button class="tab active" data-tab="events">일정</button>
+      <button class="tab" data-tab="family">가족</button>
+      <button class="tab" data-tab="export">내보내기</button>
+    </nav>
+  </header>
+
+  <main class="main">
+    <!-- EVENTS -->
+    <section id="tab-events" class="panel active">
+      <div class="card">
+        <h2>청약 일정 추가</h2>
+        <form id="event-form" class="form">
+          <label>
+            회사명
+            <input id="companyName" required placeholder="예: OOO" />
+          </label>
+
+          <div class="row">
+            <label>
+              청약 시작일
+              <input id="startDate" type="date" required />
+            </label>
+            <label>
+              청약 종료일
+              <input id="endDate" type="date" required />
+            </label>
+          </div>
+
+          <label>
+            주간사/가능 증권사 (메모)
+            <input id="underwriters" placeholder="예: 미래에셋, NH, 키움" />
+          </label>
+
+          <label>
+            메모
+            <input id="memo" placeholder="예: 균등/비례, 우대조건 등" />
+          </label>
+
+          <label class="inline">
+            <input id="starred" type="checkbox" checked />
+            관심(⭐) — 캘린더 알림 포함
+          </label>
+
+          <button type="submit" class="btn primary">추가</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <div class="row space">
+          <h2>등록된 일정</h2>
+          <small class="muted">팁: ⭐만 캘린더로 내보내면 알림이 과해지는 걸 막을 수 있어요.</small>
+        </div>
+        <div id="events-list" class="list"></div>
+      </div>
+
+      <div class="card note">
+        <h3>주의</h3>
+        <p class="muted">
+          일정은 참고용입니다. 최종 청약 일정/주간사는 반드시 공식 공지로 확인하세요.
+        </p>
+      </div>
+    </section>
+
+    <!-- FAMILY -->
+    <section id="tab-family" class="panel">
+      <div class="card">
+        <h2>가족 관리</h2>
+        <form id="family-form" class="form">
+          <div class="row">
+            <label>
+              이름
+              <input id="memberName" required placeholder="예: 엄마" />
+            </label>
+            <label>
+              증권사 메모(선택)
+              <input id="brokerNote" placeholder="예: 키움/미래에셋" />
+            </label>
+          </div>
+          <button type="submit" class="btn primary">가족 추가</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <h2>가족 목록</h2>
+        <div id="family-list" class="list"></div>
+        <small class="muted">기본으로 4명이 자동 생성돼요. 필요하면 이름만 바꿔도 OK.</small>
+      </div>
+    </section>
+
+    <!-- EXPORT -->
+    <section id="tab-export" class="panel">
+      <div class="card">
+        <h2>캘린더(.ics) 내보내기</h2>
+        <p class="muted">
+          아이폰에서는 .ics 파일을 열면 Apple Calendar로 “가져오기”가 됩니다.
+          가져온 뒤에는 캘린더 알림이 폰에서 자동으로 울려요.
+        </p>
+
+        <div class="form">
+          <label>
+            캘린더 이름(표시용)
+            <input id="calName" value="공모 알림" />
+          </label>
+
+          <div class="row">
+            <button id="export-starred" class="btn primary">⭐ 관심 일정만 .ics 다운로드</button>
+            <button id="export-all" class="btn">전체 일정 .ics 다운로드</button>
+          </div>
+
+          <details class="details">
+            <summary>아이폰에서 알림 제대로 울리게 설정</summary>
+            <ul class="muted">
+              <li>캘린더 앱 → <b>캘린더</b> → 새 캘린더(예: “공모 알림”)를 만들어두면 관리가 쉬워요.</li>
+              <li>.ics 가져올 때 그 캘린더로 넣으면, 나중에 캘린더만 꺼/삭제하면 정리 끝.</li>
+              <li>설정 → 알림 → 캘린더 → 알림 허용이 켜져 있어야 해요.</li>
+            </ul>
+          </details>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>이번 MVP에서 “자동 계좌조회”는 제외</h2>
+        <p class="muted">
+          가족 계좌/잔고 통합 자동조회는 금융 연동(마이데이터 등) 허들이 커서 2단계로 두는 게 현실적이에요.
+          대신 체크리스트로 “예수금 확인 / 청약 완료”를 빠르게 관리하게 했어요.
+        </p>
+      </div>
+    </section>
+  </main>
+
+  <!-- MODAL -->
+  <div id="modal" class="modal hidden" aria-hidden="true">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3 id="modal-title">상세</h3>
+        <button id="modal-close" class="icon-btn" aria-label="닫기">✕</button>
+      </div>
+      <div id="modal-body"></div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('./sw.js').catch(()=>{});
+    }
+  </script>
+<div class="card">
+  <h2>DART에서 원클릭 가져오기</h2>
+  <div class="form">
+    <input id="dart-year" type="number" value="2026" min="2015" />
+    <input id="dart-month" type="number" value="2" min="1" max="12" />
+    <button id="import-dart" class="btn primary" type="button">
+      DART에서 일정 자동 채우기
+    </button>
+  </div>
+  <small id="dart-status" class="muted"></small>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,2 @@
+/api/dart-ipo  /.netlify/functions/dart-ipo  200
+
