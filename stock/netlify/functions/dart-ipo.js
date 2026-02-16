@@ -1,372 +1,469 @@
 // stock/netlify/functions/dart-ipo.js
-// DART 청약달력(dsac008)에서 "청약(지분증권)" 일정 파싱
-// + KIND 상장사 목록으로 필터링(상장사 유상증자/권리 등 제거)
-// + ✅ 월별 캐시 키 분리 (YYYY-MM) : "2월 HTML을 3월에 재사용" 버그 방지
+// Netlify Function: /.netlify/functions/dart-ipo?mode=next2months
+//
+// 핵심:
+// 1) DART 청약달력(dsac008)은 월 선택이 GET로 잘 안 먹는 경우가 있어 POST로 시도
+// 2) 이번달+다음달을 합쳐서 "오늘~다음달 말"만 반환
+// 3) 상장사(유증/추가발행 등) 섞이는 문제는 KIND 상장사 목록으로 필터링
+// 4) 증권사/균등최소금액은 '보조 데이터'라 비어있을 수 있음 (안 깨지게 best-effort)
 
-export const handler = async (event) => {
-  // CORS
-  if (event.httpMethod === "OPTIONS") {
-    return {
-      statusCode: 204,
-      headers: corsHeaders(),
-      body: "",
-    };
-  }
+const DART_URL = "https://dart.fss.or.kr/dsac008/main.do";
+const KIND_LIST_URL = "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download";
+const AUX_38_URL = "https://www.38.co.kr/html/fund/?o=k";
 
-  try {
-    const url = new URL(event.rawUrl || "https://example.com");
-    const year = (url.searchParams.get("year") || "").trim();
-    const month = (url.searchParams.get("month") || "").trim();
-
-    const { y, m } = normalizeYearMonth(year, month);
-
-    // 1) DART 달력 HTML 가져오기(✅ YYYY-MM 캐시)
-    const html = await getDsac008Html(y, m);
-
-    // 2) HTML -> text lines -> 일정 파싱
-    const lines = htmlToLines(html);
-    const rawItems = parseDsac008LinesToItems(lines, y, m); // {corp_name, market_short, market, sbd_start, sbd_end}
-
-    // 3) KIND 상장사 목록 가져오기(✅ 하루 캐시)
-    const listedSet = await getKindListedNameSet();
-
-    // 4) 상장사 제거 => "공모(비상장)" 성격만 남기기
-    let excluded_listed = 0;
-    const items = rawItems.filter((it) => {
-      if (listedSet.has(normalizeCorpName(it.corp_name))) {
-        excluded_listed += 1;
-        return false;
-      }
-      return true;
-    });
-
-    return json(200, {
-      ok: true,
-      source: "dart-dsac008 + kind-listed-filter(euc-kr)",
-      year: String(y),
-      month: String(m).padStart(2, "0"),
-      count: items.length,
-      excluded_listed,
-      listed_filter_stale: false,
-      listed_set_size: listedSet.size,
-      items,
-      debug: {
-        raw_count: rawItems.length,
-      },
-    });
-  } catch (err) {
-    return json(500, {
-      ok: false,
-      error: String(err?.message || err),
-    });
-  }
-};
-
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Content-Type",
-    "Access-Control-Allow-Methods": "GET,OPTIONS",
-    "Content-Type": "application/json; charset=utf-8",
-    "Cache-Control": "no-store",
-  };
-}
+let LISTED_CACHE = { ts: 0, set: null };
+let AUX_CACHE = { ts: 0, map: null };
 
 function json(statusCode, obj) {
   return {
     statusCode,
-    headers: corsHeaders(),
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "access-control-allow-origin": "*",
+    },
     body: JSON.stringify(obj),
   };
 }
 
-function normalizeYearMonth(yearStr, monthStr) {
-  // 기본값: 한국시간 기준 "이번달"
-  const nowKst = new Date(Date.now() + 9 * 60 * 60 * 1000);
-  let y = parseInt(yearStr, 10);
-  let m = parseInt(monthStr, 10);
+function pad2(n) { return String(n).padStart(2, "0"); }
 
-  if (!Number.isFinite(y) || y < 2015 || y > 2100) y = nowKst.getUTCFullYear();
-  if (!Number.isFinite(m) || m < 1 || m > 12) m = nowKst.getUTCMonth() + 1;
+function kstNow() {
+  const now = new Date();
+  return new Date(now.getTime() + 9 * 60 * 60 * 1000);
+}
 
+function kstTodayISO() {
+  return kstNow().toISOString().slice(0, 10);
+}
+
+function endOfNextMonthISO() {
+  const k = kstNow();
+  const y = k.getUTCFullYear();
+  const m = k.getUTCMonth();
+  const end = new Date(Date.UTC(y, m + 2, 0));
+  return end.toISOString().slice(0, 10);
+}
+
+function ymFromISO(iso) {
+  // YYYY-MM-DD -> {y, m}
+  const y = Number(iso.slice(0, 4));
+  const m = Number(iso.slice(5, 7));
   return { y, m };
 }
 
-/* -----------------------------
- *  ✅ DART HTML 월별 캐시
- * ----------------------------- */
-const DSAC008_CACHE = new Map(); // key "YYYY-MM" -> { html, ts }
-const DSAC008_TTL_MS = 10 * 60 * 1000; // 10분
-
-function ymKey(y, m) {
-  return `${y}-${String(m).padStart(2, "0")}`;
+function nextMonth(y, m) {
+  // m: 1-12
+  const nm = m + 1;
+  if (nm <= 12) return { y, m: nm };
+  return { y: y + 1, m: 1 };
 }
 
-async function getDsac008Html(y, m) {
-  const key = ymKey(y, m);
-  const now = Date.now();
-  const hit = DSAC008_CACHE.get(key);
-  if (hit && now - hit.ts < DSAC008_TTL_MS) {
-    return hit.html;
-  }
-  const html = await fetchDsac008HtmlFromDart(y, m);
-  DSAC008_CACHE.set(key, { html, ts: now });
-  return html;
-}
-
-async function fetchDsac008HtmlFromDart(y, m) {
-  // DART 청약달력(지분증권)
-  // ✅ 이 URL은 브라우저에서 year/month 바꿔도 동작하는 형태로 맞춤
-  const mm = String(m).padStart(2, "0");
-  const u = `https://dart.fss.or.kr/dsac008/main.do?selectYear=${encodeURIComponent(
-    y
-  )}&selectMonth=${encodeURIComponent(mm)}`;
-
-  const html = await fetchText(u, {
-    headers: {
-      "user-agent":
-        "Mozilla/5.0 (compatible; ipo-bot/1.0; +https://netlify.app)",
-      accept: "text/html,application/xhtml+xml",
-    },
-    timeoutMs: 12000,
-  });
-
-  if (!html || html.length < 2000) {
-    throw new Error("DART HTML too small / blocked");
-  }
-  return html;
-}
-
-async function fetchText(url, { headers = {}, timeoutMs = 10000 } = {}) {
-  const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), timeoutMs);
-
+async function fetchWithTimeout(url, opts = {}, ms = 12000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
   try {
-    const res = await fetch(url, { headers, signal: ac.signal });
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status} fetching ${url}`);
-    }
-    const buf = await res.arrayBuffer();
-
-    // DART는 보통 UTF-8
-    const text = new TextDecoder("utf-8").decode(buf);
-    return text;
+    const res = await fetch(url, { ...opts, signal: ctrl.signal, redirect: "follow" });
+    return res;
   } finally {
     clearTimeout(t);
   }
 }
 
-/* -----------------------------
- *  ✅ KIND 상장사 목록 캐시
- * ----------------------------- */
-let KIND_LISTED_CACHE = null; // { set, ts }
-const KIND_TTL_MS = 24 * 60 * 60 * 1000; // 24시간
-
-async function getKindListedNameSet() {
-  const now = Date.now();
-  if (KIND_LISTED_CACHE && now - KIND_LISTED_CACHE.ts < KIND_TTL_MS) {
-    return KIND_LISTED_CACHE.set;
-  }
-
-  // KIND 상장법인 목록 다운로드 (엑셀처럼 보이지만 실제로는 HTML 테이블인 경우 많음)
-  const url = "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download";
-
-  const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), 15000);
-
-  try {
-    const res = await fetch(url, {
-      headers: {
-        "user-agent":
-          "Mozilla/5.0 (compatible; ipo-bot/1.0; +https://netlify.app)",
-        accept: "*/*",
-      },
-      signal: ac.signal,
-    });
-
-    if (!res.ok) throw new Error(`KIND corpList HTTP ${res.status}`);
-
-    const buf = await res.arrayBuffer();
-
-    // ✅ KIND 다운로드는 EUC-KR인 경우가 많음
-    // Netlify Node 런타임은 보통 euc-kr 디코딩 가능(Full ICU)
-    let text;
-    try {
-      text = new TextDecoder("euc-kr").decode(buf);
-    } catch {
-      // fallback
-      text = new TextDecoder("utf-8").decode(buf);
-    }
-
-    const set = parseKindCorpListToNameSet(text);
-    KIND_LISTED_CACHE = { set, ts: now };
-    return set;
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-function parseKindCorpListToNameSet(text) {
-  const set = new Set();
-
-  // corpList download가 HTML인 경우를 가정하고 <tr> 단위로 파싱
-  const rows = text.split(/<\/tr>/i);
-  for (const row of rows) {
-    const tds = [...row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map((m) =>
-      stripHtml(m[1])
-    );
-    if (!tds || tds.length < 2) continue;
-
-    const name = normalizeCorpName(tds[0]);
-    if (!name) continue;
-    if (name === "회사명" || name.includes("회사명")) continue;
-
-    set.add(name);
-  }
-
-  return set;
-}
-
-/* -----------------------------
- *  HTML -> lines -> 일정 파싱
- * ----------------------------- */
-function htmlToLines(html) {
-  // script/style 제거
-  let s = html
-    .replace(/<script[\s\S]*?<\/script>/gi, "\n")
-    .replace(/<style[\s\S]*?<\/style>/gi, "\n");
-
-  // 줄바꿈이 될만한 태그들 처리
-  s = s
+function stripTags(html) {
+  return String(html || "")
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, " ")
+    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, " ")
     .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/(li|p|div|tr|td|th|h\d)>/gi, "\n");
-
-  // 태그 제거
-  s = stripHtml(s);
-
-  // 공백 정리
-  s = s.replace(/\r/g, "\n");
-  s = s.replace(/[ \t]+/g, " ");
-  s = s.replace(/\n{2,}/g, "\n");
-
-  const lines = s
-    .split("\n")
-    .map((x) => x.trim())
-    .filter((x) => x.length > 0);
-
-  return lines;
-}
-
-function stripHtml(input) {
-  return decodeHtmlEntities(String(input || ""))
+    .replace(/<\/(p|div|li|tr|td|th|h\d)>/gi, "\n")
     .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"');
 }
 
-function decodeHtmlEntities(s) {
-  return s
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) =>
-      String.fromCharCode(parseInt(hex, 16))
-    )
-    .replace(/&#([0-9]+);/g, (_, num) =>
-      String.fromCharCode(parseInt(num, 10))
-    );
+function normalizeLines(text) {
+  return stripTags(text)
+    .split(/\r?\n/)
+    .map(s => s.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
 }
 
-function parseDsac008LinesToItems(lines, y, m) {
-  // lines 흐름 중 숫자(1~31)를 현재 날짜로 보고,
-  // "코/유/기" 같은 마켓 표식 다음에 "회사명 [시작/종료]" 패턴을 잡는다.
-  let currentDay = null;
-  let lastMarketShort = null;
-
-  const startMap = new Map(); // corp -> { start, market_short, market }
-  const endMap = new Map(); // corp -> end
-
-  for (const token of lines) {
-    // 날짜(일)
-    if (/^\d{1,2}$/.test(token)) {
-      const d = parseInt(token, 10);
-      if (d >= 1 && d <= 31) {
-        currentDay = d;
-      }
-      continue;
-    }
-
-    // 마켓(짧은 표기)
-    if (token === "코" || token === "유" || token === "기" || token === "콘") {
-      lastMarketShort = token;
-      continue;
-    }
-
-    // 회사명 [시작]/[종료]
-    // 예: "케이뱅크 [시작]"
-    const mm = token.match(/^(.+?)\s*\[(시작|종료)\]$/);
-    if (mm && currentDay) {
-      const corpName = normalizeCorpName(mm[1]);
-      const type = mm[2]; // 시작/종료
-      const date = formatDate(y, m, currentDay);
-
-      const market_short = lastMarketShort || "";
-      const market = marketFromShort(market_short);
-
-      if (type === "시작") {
-        startMap.set(corpName, {
-          sbd_start: date,
-          market_short,
-          market,
-        });
-      } else {
-        endMap.set(corpName, date);
-      }
-    }
-  }
-
-  // 합치기
-  const items = [];
-  for (const [corp_name, st] of startMap.entries()) {
-    const sbd_start = st.sbd_start;
-    const sbd_end = endMap.get(corp_name) || sbd_start;
-
-    items.push({
-      corp_name,
-      market_short: st.market_short || "",
-      market: st.market || "",
-      sbd_start,
-      sbd_end,
-    });
-  }
-
-  // 날짜순 정렬
-  items.sort((a, b) => (a.sbd_start < b.sbd_start ? -1 : a.sbd_start > b.sbd_start ? 1 : 0));
-
-  return items;
-}
-
-function marketFromShort(short) {
+function detectMarket(short) {
   if (short === "코") return "KOSDAQ";
   if (short === "유") return "KOSPI";
-  if (short === "콘") return "KONEX";
-  if (short === "기") return "ETC";
-  return "";
+  return "ETC";
 }
 
-function formatDate(y, m, d) {
-  const yy = String(y);
-  const mm = String(m).padStart(2, "0");
-  const dd = String(d).padStart(2, "0");
-  return `${yy}-${mm}-${dd}`;
+function parseDsac008Marks(lines, year, month) {
+  // lines: visible text tokens
+  // Output: marks = [{corp_name, market_short, type:'start'|'end', date:'YYYY-MM-DD'}]
+  const mm = pad2(month);
+  const marks = [];
+
+  let currentDay = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const tok = lines[i];
+
+    // day tokens: "1" or "02" etc
+    if (/^\d{1,2}$/.test(tok)) {
+      const d = Number(tok);
+      if (d >= 1 && d <= 31) currentDay = d;
+      continue;
+    }
+    if (/^\d{2}$/.test(tok)) {
+      const d = Number(tok);
+      if (d >= 1 && d <= 31) currentDay = d;
+      continue;
+    }
+
+    // event tokens often look like: "코 아이씨에이치 [시작]" or "기 케이뱅크 [종료]"
+    // sometimes bullet/extra chars may exist; we keep robust
+    const m = tok.match(/^(코|유|기)\s+(.+?)\s+\[(시작|종료)\]$/);
+    if (m && currentDay) {
+      const market_short = m[1];
+      const corp_name = m[2].trim();
+      const type = (m[3] === "시작") ? "start" : "end";
+      const date = `${year}-${mm}-${pad2(currentDay)}`;
+      marks.push({ corp_name, market_short, type, date });
+      continue;
+    }
+
+    // Some lines may embed multiple events; split by " ]" patterns by scanning
+    // Example: "코 A [종료] 기 B [시작] ..."
+    if (currentDay && (tok.includes("[시작]") || tok.includes("[종료]"))) {
+      // Replace with separators then parse pieces
+      const expanded = tok
+        .replace(/\s+\[/g, " [")
+        .replace(/\]\s+/g, "]\n");
+      const parts = expanded.split("\n").map(s => s.trim()).filter(Boolean);
+      for (const p of parts) {
+        const mm2 = p.match(/^(코|유|기)\s+(.+?)\s+\[(시작|종료)\]$/);
+        if (mm2) {
+          const market_short = mm2[1];
+          const corp_name = mm2[2].trim();
+          const type = (mm2[3] === "시작") ? "start" : "end";
+          const date = `${year}-${mm}-${pad2(currentDay)}`;
+          marks.push({ corp_name, market_short, type, date });
+        }
+      }
+    }
+  }
+
+  return marks;
 }
 
-function normalizeCorpName(name) {
-  return String(name || "")
-    .replace(/\s+/g, " ")
-    .replace(/\u00A0/g, " ")
-    .trim();
+function pairMarksToEvents(marks) {
+  // group by corp_name
+  const by = new Map();
+  for (const mk of marks) {
+    if (!mk.corp_name) continue;
+    const arr = by.get(mk.corp_name) || [];
+    arr.push(mk);
+    by.set(mk.corp_name, arr);
+  }
+
+  const events = [];
+  for (const [corp, arr] of by.entries()) {
+    arr.sort((a, b) => a.date.localeCompare(b.date));
+    let currentStart = null;
+    let market_short = arr.find(x => x.market_short)?.market_short || "기";
+
+    for (const mk of arr) {
+      market_short = mk.market_short || market_short;
+      if (mk.type === "start") {
+        currentStart = mk.date;
+      } else {
+        // end
+        if (currentStart) {
+          events.push({
+            corp_name: corp,
+            market_short,
+            market: detectMarket(market_short),
+            sbd_start: currentStart,
+            sbd_end: mk.date,
+          });
+          currentStart = null;
+        } else {
+          events.push({
+            corp_name: corp,
+            market_short,
+            market: detectMarket(market_short),
+            sbd_start: mk.date,
+            sbd_end: mk.date,
+          });
+        }
+      }
+    }
+
+    if (currentStart) {
+      events.push({
+        corp_name: corp,
+        market_short,
+        market: detectMarket(market_short),
+        sbd_start: currentStart,
+        sbd_end: currentStart,
+      });
+    }
+  }
+
+  // dedupe
+  const seen = new Set();
+  const out = [];
+  for (const e of events) {
+    const k = `${e.corp_name}__${e.sbd_start}__${e.sbd_end}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(e);
+  }
+  return out;
 }
+
+async function fetchDsac008Month(year, month) {
+  // Try POST first (most likely correct)
+  const body = new URLSearchParams({
+    selectYear: String(year),
+    selectMonth: pad2(month),
+  }).toString();
+
+  const res = await fetchWithTimeout(DART_URL, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+      "referer": DART_URL,
+      "user-agent": "Mozilla/5.0 (compatible; ipo-alarm/1.0)",
+    },
+    body,
+  }, 12000);
+
+  const buf = await res.arrayBuffer();
+  const text = new TextDecoder("utf-8").decode(buf);
+  return { ok: res.ok, status: res.status, text };
+}
+
+async function getListedSet() {
+  const now = Date.now();
+  if (LISTED_CACHE.set && (now - LISTED_CACHE.ts) < 24 * 60 * 60 * 1000) {
+    return { set: LISTED_CACHE.set, stale: false };
+  }
+
+  const res = await fetchWithTimeout(KIND_LIST_URL, {
+    headers: {
+      "user-agent": "Mozilla/5.0 (compatible; ipo-alarm/1.0)",
+      "referer": "https://kind.krx.co.kr/",
+    }
+  }, 12000);
+
+  const buf = await res.arrayBuffer();
+
+  // KIND download is usually EUC-KR
+  let html = "";
+  try {
+    html = new TextDecoder("euc-kr").decode(buf);
+  } catch {
+    html = new TextDecoder("utf-8").decode(buf);
+  }
+
+  // Extract corp names from td cells; first column often 회사명
+  const set = new Set();
+  const rows = html.match(/<tr[\s\S]*?<\/tr>/gi) || [];
+  for (const r of rows) {
+    const tds = r.match(/<td[\s\S]*?<\/td>/gi);
+    if (!tds || tds.length === 0) continue;
+    // first td text
+    const name = stripTags(tds[0]).replace(/\s+/g, " ").trim();
+    if (name && name !== "회사명") set.add(name);
+  }
+
+  LISTED_CACHE = { ts: now, set };
+  return { set, stale: false };
+}
+
+async function getAuxMap38() {
+  const now = Date.now();
+  if (AUX_CACHE.map && (now - AUX_CACHE.ts) < 6 * 60 * 60 * 1000) {
+    return { map: AUX_CACHE.map, stale: false };
+  }
+
+  // best-effort: do not fail the whole function
+  try {
+    const res = await fetchWithTimeout(AUX_38_URL, {
+      headers: {
+        "user-agent": "Mozilla/5.0 (compatible; ipo-alarm/1.0)",
+        "referer": "https://www.38.co.kr/",
+      }
+    }, 12000);
+
+    const buf = await res.arrayBuffer();
+
+    // 38 is often EUC-KR
+    let html = "";
+    try { html = new TextDecoder("euc-kr").decode(buf); }
+    catch { html = new TextDecoder("utf-8").decode(buf); }
+
+    // Parse first table header to locate indices
+    const tableMatch = html.match(/<table[\s\S]*?<\/table>/i);
+    if (!tableMatch) throw new Error("no table");
+    const table = tableMatch[0];
+
+    const headerRow = (table.match(/<tr[\s\S]*?<\/tr>/i) || [])[0] || "";
+    const headers = (headerRow.match(/<th[\s\S]*?<\/th>/gi) || []).map(h => stripTags(h).trim());
+
+    const idxName = headers.findIndex(h => /종목|기업|회사/.test(h));
+    const idxUw = headers.findIndex(h => /주간사|대표주관|인수/.test(h));
+    const idxMin = headers.findIndex(h => /균등|최소/.test(h));
+
+    // If we can't detect, return empty map
+    if (idxName < 0) {
+      AUX_CACHE = { ts: now, map: new Map() };
+      return { map: AUX_CACHE.map, stale: false };
+    }
+
+    const map = new Map();
+    const rows = table.match(/<tr[\s\S]*?<\/tr>/gi) || [];
+    for (const r of rows.slice(1)) {
+      const cells = (r.match(/<td[\s\S]*?<\/td>/gi) || []).map(td => stripTags(td).replace(/\s+/g, " ").trim());
+      if (!cells || cells.length === 0) continue;
+
+      const name = (cells[idxName] || "").trim();
+      if (!name) continue;
+
+      const underwriters = (idxUw >= 0 ? (cells[idxUw] || "").trim() : "");
+      const minRaw = (idxMin >= 0 ? (cells[idxMin] || "").trim() : "");
+
+      const minDeposit = parseMoneyToInt(minRaw);
+      map.set(name, { underwriters, min_deposit: minDeposit });
+    }
+
+    AUX_CACHE = { ts: now, map };
+    return { map, stale: false };
+
+  } catch {
+    AUX_CACHE = { ts: now, map: new Map() };
+    return { map: AUX_CACHE.map, stale: true };
+  }
+}
+
+function parseMoneyToInt(s) {
+  const t = String(s || "").replace(/\s+/g, "");
+  if (!t) return null;
+
+  // examples: "250,000", "25만원", "1.2억" etc (best-effort)
+  let num = null;
+
+  if (t.includes("억")) {
+    // "1.2억" -> 120,000,000
+    const v = parseFloat(t.replace(/[^\d.]/g, ""));
+    if (!Number.isNaN(v)) num = Math.round(v * 100000000);
+  } else if (t.includes("만원")) {
+    const v = parseFloat(t.replace(/[^\d.]/g, ""));
+    if (!Number.isNaN(v)) num = Math.round(v * 10000);
+  } else {
+    const digits = t.replace(/[^\d]/g, "");
+    if (digits) num = Number(digits);
+  }
+
+  if (!num || Number.isNaN(num) || num <= 0) return null;
+  return num;
+}
+
+exports.handler = async (event) => {
+  try {
+    const qs = event.queryStringParameters || {};
+    const mode = (qs.mode || "next2months").toLowerCase();
+    const debug = qs.debug === "1";
+
+    const today = kstTodayISO();
+    const endNext = endOfNextMonthISO();
+    const { y: y1, m: m1 } = ymFromISO(today);
+    const { y: y2, m: m2 } = nextMonth(y1, m1);
+
+    const monthsToFetch = (mode === "next2months")
+      ? [{ year: y1, month: m1 }, { year: y2, month: m2 }]
+      : (() => {
+          const year = Number(qs.year);
+          const month = Number(qs.month);
+          if (!year || !month) return [{ year: y1, month: m1 }];
+          return [{ year, month }];
+        })();
+
+    // fetch DART months
+    const monthTexts = [];
+    for (const ym of monthsToFetch) {
+      const r = await fetchDsac008Month(ym.year, ym.month);
+      if (!r.ok) {
+        return json(200, {
+          ok: false,
+          error: `DART fetch failed: HTTP ${r.status}`,
+        });
+      }
+      monthTexts.push({ ...ym, text: r.text });
+    }
+
+    // stale detection: if month html identical, it's likely month switching failed -> warn + skip duplicates
+    let warn = "";
+    if (monthTexts.length === 2) {
+      const a = monthTexts[0].text;
+      const b = monthTexts[1].text;
+      if (a && b && a.length === b.length && a === b) {
+        warn = "다음달 화면을 못 불러온 것 같아요(응답이 동일). 중복 방지로 다음달은 제외했어요.";
+        monthTexts.pop(); // keep only first
+      }
+    }
+
+    // parse marks
+    let allMarks = [];
+    for (const mt of monthTexts) {
+      const lines = normalizeLines(mt.text);
+      const marks = parseDsac008Marks(lines, mt.year, mt.month);
+      allMarks = allMarks.concat(marks);
+      if (debug) {
+        // keep a small portion if needed
+      }
+    }
+
+    let rawEvents = pairMarksToEvents(allMarks);
+
+    // range filter
+    rawEvents = rawEvents.filter(e => e.sbd_start <= endNext && e.sbd_end >= today);
+
+    // listed filter
+    const listed = await getListedSet();
+    const before = rawEvents.length;
+    const filtered = rawEvents.filter(e => !listed.set.has(e.corp_name));
+    const excluded_listed = before - filtered.length;
+
+    // aux data (optional)
+    const aux = await getAuxMap38();
+    const items = filtered.map(e => {
+      const extra = aux.map.get(e.corp_name);
+      return {
+        ...e,
+        underwriters: extra?.underwriters || "",
+        min_deposit: extra?.min_deposit || null,
+      };
+    });
+
+    return json(200, {
+      ok: true,
+      source: "dart-dsac008 + kind-listed-filter + range(today~end-next-month)",
+      range: { from: today, to: endNext },
+      count: items.length,
+      excluded_listed,
+      aux_stale: aux.stale || false,
+      warn: warn || undefined,
+      items,
+      ...(debug ? { debug_months: monthsToFetch } : {}),
+    });
+
+  } catch (err) {
+    return json(200, {
+      ok: false,
+      error: err?.message || String(err),
+    });
+  }
+};
