@@ -481,3 +481,69 @@ document.querySelector("#import-dart")?.addEventListener("click", async () => {
     alert(`DART 가져오기 실패: ${err.message || err}`);
   }
 });
+
+document.addEventListener("DOMContentLoaded", () => {
+  const btn = document.getElementById("import-dart");
+  const status = document.getElementById("import-status");
+  if (!btn) return;
+
+  btn.addEventListener("click", async () => {
+    try {
+      btn.disabled = true;
+      if (status) status.textContent = "불러오는 중…";
+
+      // 원하는 년/월로 바꾸고 싶으면 여기만 수정
+      const year = "2026";
+      const month = "02";
+
+      const res = await fetch(`/api/dart-ipo?year=${year}&month=${month}`);
+      const data = await res.json();
+
+      if (!data.ok) throw new Error(data.error || "import failed");
+
+      // ✅ 너 앱이 store/events 구조일 때
+      window.store = window.store || { events: [] };
+
+      const existing = new Set((store.events || []).map(e => `${e.companyName}|${e.startDate}|${e.endDate}`));
+      let added = 0;
+
+      for (const it of data.items || []) {
+        const companyName = it.corp_name;
+        const startDate = it.sbd_start;
+        const endDate = it.sbd_end;
+
+        const key = `${companyName}|${startDate}|${endDate}`;
+        if (existing.has(key)) continue;
+
+        const ev = {
+          id: (typeof uid === "function") ? uid() : crypto.randomUUID(),
+          companyName,
+          startDate,
+          endDate,
+          market: it.market,
+          memo: `DART 청약달력 (${it.market_short})`,
+          starred: true,
+          perMember: {}
+        };
+
+        store.events.push(ev);
+        existing.add(key);
+        added++;
+      }
+
+      // 저장/리렌더 (너 앱에 함수가 있으면 사용)
+      if (typeof saveStore === "function") saveStore(store);
+      else localStorage.setItem("store", JSON.stringify(store));
+
+      if (typeof renderAll === "function") renderAll();
+
+      if (status) status.textContent = `완료! ${added}개 추가됨`;
+    } catch (e) {
+      console.error(e);
+      if (status) status.textContent = `실패: ${e.message || e}`;
+      alert(`가져오기 실패: ${e.message || e}`);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+});
