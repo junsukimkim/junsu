@@ -1,38 +1,103 @@
-// netlify/functions/dart-ipo.js
-// DART 청약달력(지분증권) + (옵션) OpenDART list.json으로 '상장사(stock_code 존재)' 제거
+// stock/netlify/functions/dart-ipo.js
+// DART 청약달력(지분증권)에서 월별 청약 일정 파싱
+// - "코" / "유" / "넥" / "기" 가 한 줄로 따로 나오는 경우까지 처리
+// - mode=all : 필터 없이 달력 파싱 결과 그대로
+// - mode=ipo : (현재는 가볍게) ETC(기)도 포함하되, 필터 로직은 추후 추가 가능
+// - debug=1 : debug_lines_first_200 포함
+
+const https = require("node:https");
 
 const DART_CAL_URL = "https://dart.fss.or.kr/dsac008/main.do";
-const OPENDART_LIST_URL = "https://opendart.fss.or.kr/api/list.json";
 
 function pad2(n) {
   const s = String(n);
   return s.length === 1 ? "0" + s : s;
 }
 
-function lastDayOfMonth(year, month) {
-  return new Date(Number(year), Number(month), 0).getDate(); // month는 1~12
-}
+function fetchCompat(url, { method = "GET", headers = {}, body = null, maxRedirects = 3 } = {}) {
+  // Node 18+면 fetch가 있음
+  if (typeof fetch === "function") {
+    return fetch(url, {
+      method,
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (compatible; NetlifyFunction/1.0; +https://www.netlify.com/)",
+        "accept-encoding": "identity",
+        ...headers,
+      },
+      body,
+      redirect: "manual",
+    }).then(async (res) => {
+      // redirect 처리
+      if (res.status >= 300 && res.status < 400 && res.headers.get("location") && maxRedirects > 0) {
+        const next = new URL(res.headers.get("location"), url).toString();
+        return fetchCompat(next, { method: "GET", headers, body: null, maxRedirects: maxRedirects - 1 });
+      }
+      return { ok: res.ok, status: res.status, text: await res.text() };
+    });
+  }
 
-function normName(s) {
-  return String(s || "")
-    .toLowerCase()
-    .replace(/\s+/g, "")
-    .replace(/[()（）.,·]/g, "")
-    .replace(/㈜|주식회사|\(주\)/g, "")
-    .trim();
-}
+  // fetch 없으면 https fallback
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const opts = {
+      method,
+      hostname: u.hostname,
+      path: u.pathname + u.search,
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (compatible; NetlifyFunction/1.0; +https://www.netlify.com/)",
+        "accept-encoding": "identity",
+        ...headers,
+      },
+    };
 
-async function fetchText(url, options = {}) {
-  const res = await fetch(url, {
-    redirect: "follow",
-    ...options,
-    headers: {
-      "user-agent":
-        "Mozilla/5.0 (compatible; NetlifyFunction/1.0; +https://www.netlify.com/)",
-      ...(options.headers || {}),
-    },
+    const req = https.request(opts, (res) => {
+      const chunks = [];
+      res.on("data", (d) => chunks.push(d));
+      res.on("end", () => {
+        const buf = Buffer.concat(chunks);
+        const loc = res.headers.location;
+
+        if (res.statusCode >= 300 && res.statusCode < 400 && loc && maxRedirects > 0) {
+          const next = new URL(loc, url).toString();
+          fetchCompat(next, { method: "GET", headers, body: null, maxRedirects: maxRedirects - 1 })
+            .then(resolve)
+            .catch(reject);
+          return;
+        }
+
+        resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, text: buf.toString("utf8") });
+      });
+    });
+
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
   });
-  return { ok: res.ok, status: res.status, text: await res.text() };
+}
+
+async function fetchDartCalendarHtml(year, month) {
+  const y = String(year);
+  const m = pad2(month);
+
+  // DART는 폼 POST가 먹히는 경우가 많음
+  const body = new URLSearchParams();
+  body.set("selectYear", y);
+  body.set("selectMonth", m);
+
+  const r = await fetchCompat(DART_CAL_URL, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+  });
+
+  // 실패하면 GET fallback
+  if (!r.ok || !r.text) {
+    const r2 = await fetchCompat(DART_CAL_URL, { method: "GET" });
+    return r2.text || "";
+  }
+  return r.text;
 }
 
 function htmlToLines(html) {
@@ -52,49 +117,47 @@ function parseCalendarItems(lines, year, month) {
   const m = pad2(month);
 
   let currentDay = null;
-  const startMap = new Map();
+  let pendingMarketShort = null; // "코"가 따로 한 줄로 나오는 경우를 위해
+
   const itemsMap = new Map();
+  const startMap = new Map(); // key -> startDate
 
   const reDay = /^(\d{1,2})$/;
-  const reEvt = /^(코|유|넥|기)\s*(.+?)\s*\[(시작|종료)\]$/;
+  const reMarketOnly = /^(코|유|넥|기)$/;
+  const reNameActOnly = /^(.+?)\s*\[(시작|종료)\]$/;
+  const reBoth = /^(코|유|넥|기)\s*(.+?)\s*\[(시작|종료)\]$/;
 
-  for (const line of lines) {
-    const dm = line.match(reDay);
-    if (dm) {
-      currentDay = pad2(dm[1]);
-      continue;
-    }
+  function marketLong(ms) {
+    return ms === "유" ? "KOSPI" : ms === "코" ? "KOSDAQ" : ms === "넥" ? "KONEX" : "ETC";
+  }
 
-    const em = line.match(reEvt);
-    if (!em || !currentDay) continue;
-
-    const market_short = em[1];
-    const corp_name = em[2].trim();
-    const act = em[3];
-
-    const date = `${y}-${m}-${currentDay}`;
-    const key = `${market_short}|${corp_name}`;
-
-    const market =
-      market_short === "유"
-        ? "KOSPI"
-        : market_short === "코"
-        ? "KOSDAQ"
-        : market_short === "넥"
-        ? "KONEX"
-        : "ETC";
+  function upsert(ms, corp_name, act, date) {
+    const key = `${ms}|${corp_name}`;
 
     if (act === "시작") {
       startMap.set(key, date);
       if (!itemsMap.has(key)) {
-        itemsMap.set(key, { corp_name, market_short, market, sbd_start: date, sbd_end: date });
+        itemsMap.set(key, {
+          corp_name,
+          market_short: ms,
+          market: marketLong(ms),
+          sbd_start: date,
+          sbd_end: date,
+        });
       } else {
-        itemsMap.get(key).sbd_start = date;
+        const it = itemsMap.get(key);
+        it.sbd_start = date;
       }
     } else {
       const start = startMap.get(key) || date;
       if (!itemsMap.has(key)) {
-        itemsMap.set(key, { corp_name, market_short, market, sbd_start: start, sbd_end: date });
+        itemsMap.set(key, {
+          corp_name,
+          market_short: ms,
+          market: marketLong(ms),
+          sbd_start: start,
+          sbd_end: date,
+        });
       } else {
         const it = itemsMap.get(key);
         if (!it.sbd_start) it.sbd_start = start;
@@ -103,84 +166,52 @@ function parseCalendarItems(lines, year, month) {
     }
   }
 
+  for (const line of lines) {
+    // 1) 날짜
+    const dm = line.match(reDay);
+    if (dm) {
+      currentDay = pad2(dm[1]);
+      pendingMarketShort = null;
+      continue;
+    }
+    if (!currentDay) continue;
+
+    // 2) "코"만 단독으로 나오는 라인
+    const mm = line.match(reMarketOnly);
+    if (mm) {
+      pendingMarketShort = mm[1];
+      continue;
+    }
+
+    const date = `${y}-${m}-${currentDay}`;
+
+    // 3) "코 아이씨에이치 [시작]" 같이 한 줄로 나오는 라인
+    const both = line.match(reBoth);
+    if (both) {
+      const ms = both[1];
+      const name = both[2].trim();
+      const act = both[3];
+      upsert(ms, name, act, date);
+      pendingMarketShort = null;
+      continue;
+    }
+
+    // 4) "아이씨에이치 [시작]" 이고, 직전에 "코" 라인이 있었던 경우
+    const na = line.match(reNameActOnly);
+    if (na && pendingMarketShort) {
+      const name = na[1].trim();
+      const act = na[2];
+      upsert(pendingMarketShort, name, act, date);
+      pendingMarketShort = null;
+      continue;
+    }
+
+    // 그 외는 무시
+  }
+
   return Array.from(itemsMap.values()).sort((a, b) =>
     (a.sbd_start || "").localeCompare(b.sbd_start || "")
   );
-}
-
-async function fetchDartCalendarHtml(year, month) {
-  const y = String(year);
-  const m = pad2(month);
-
-  // DART는 폼 제출일 수 있어 POST 우선
-  const body = new URLSearchParams();
-  body.set("selectYear", y);
-  body.set("selectMonth", m);
-
-  const r = await fetchText(DART_CAL_URL, {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body,
-  });
-
-  if (r.ok && r.text) return r.text;
-
-  // fallback
-  const r2 = await fetchText(DART_CAL_URL);
-  return r2.text;
-}
-
-async function fetchOpenDartListedSet(opendartKey, year, month, targetNamesNormSet) {
-  // list.json은 corp_code 없이도 기간조회 가능하지만 3개월 제한이 있어요(월단위면 OK). :contentReference[oaicite:3]{index=3}
-  const bgn_de = `${year}${pad2(month)}01`;
-  const end_de = `${year}${pad2(month)}${pad2(lastDayOfMonth(year, month))}`;
-
-  const listed = new Set();
-
-  // 발행공시 위주로 줄이기: pblntf_ty=C (issuance). :contentReference[oaicite:4]{index=4}
-  const page_count = 100;
-  let page_no = 1;
-  let safetyPages = 0;
-
-  while (true) {
-    safetyPages++;
-    if (safetyPages > 50) break; // 과도한 호출 방지
-
-    const qs = new URLSearchParams({
-      crtfc_key: opendartKey,
-      bgn_de,
-      end_de,
-      pblntf_ty: "C",
-      page_no: String(page_no),
-      page_count: String(page_count),
-    });
-
-    const url = `${OPENDART_LIST_URL}?${qs.toString()}`;
-    const r = await fetchText(url);
-    if (!r.ok) break;
-
-    let data;
-    try { data = JSON.parse(r.text); } catch { break; }
-
-    if (data.status !== "000") break;
-
-    const list = Array.isArray(data.list) ? data.list : [];
-    for (const row of list) {
-      const corp_name = row.corp_name;
-      const stock_code = row.stock_code; // 상장사면 들어옴 :contentReference[oaicite:5]{index=5}
-      if (!corp_name) continue;
-      if (!stock_code) continue; // stock_code 없으면 비상장/기타법인 가능성
-
-      const nn = normName(corp_name);
-      if (targetNamesNormSet.has(nn)) listed.add(nn);
-    }
-
-    const total_page = Number(data.total_page || 0);
-    if (!total_page || page_no >= total_page) break;
-    page_no++;
-  }
-
-  return listed;
 }
 
 exports.handler = async (event) => {
@@ -188,36 +219,30 @@ exports.handler = async (event) => {
     const qs = event.queryStringParameters || {};
     const year = qs.year || "2026";
     const month = qs.month || "01";
-    const mode = (qs.mode || "ipo").toLowerCase(); // ipo(기본) / all
+    const mode = (qs.mode || "all").toLowerCase(); // 일단 all 기본 (확인용)
+    const debug = String(qs.debug || "") === "1";
 
     const html = await fetchDartCalendarHtml(year, month);
     const lines = htmlToLines(html);
+
+    // 파싱
     let items = parseCalendarItems(lines, year, month);
 
-    // 기본: all이면 그대로 반환
-    let filtered_out = [];
-    let note = null;
+    // mode=ipo는 나중에 더 정교하게 필터할 수 있음.
+    // 일단은 지금 "0개 문제 해결"이 목적이라, ipo도 items 그대로 반환.
+    // (필요하면 여기서 유상증자/상장사 필터를 추가로 끼워 넣으면 됨.)
 
-    if (mode !== "all") {
-      const key = process.env.OPENDART_KEY;
-      if (!key) {
-        note = "OPENDART_KEY 미설정: 유상증자(상장사) 필터를 적용하지 못해 전체가 표시될 수 있어요.";
-      } else {
-        const targets = new Set(items.map(it => normName(it.corp_name)));
-        const listedSet = await fetchOpenDartListedSet(key, year, month, targets);
+    const out = {
+      ok: true,
+      source: "dart-dsac008",
+      year: String(year),
+      month: pad2(month),
+      mode,
+      count: items.length,
+      items,
+    };
 
-        const kept = [];
-        for (const it of items) {
-          const nn = normName(it.corp_name);
-          if (listedSet.has(nn)) {
-            filtered_out.push(it);
-            continue;
-          }
-          kept.push(it);
-        }
-        items = kept;
-      }
-    }
+    if (debug) out.debug_lines_first_200 = lines.slice(0, 200);
 
     return {
       statusCode: 200,
@@ -226,22 +251,7 @@ exports.handler = async (event) => {
         "cache-control": "no-store",
         "access-control-allow-origin": "*",
       },
-      body: JSON.stringify(
-        {
-          ok: true,
-          source: "dart-dsac008",
-          year: String(year),
-          month: pad2(month),
-          mode,
-          count: items.length,
-          items,
-          filtered_out_count: filtered_out.length,
-          filtered_out_preview: filtered_out.slice(0, 20),
-          note,
-        },
-        null,
-        2
-      ),
+      body: JSON.stringify(out, null, 2),
     };
   } catch (e) {
     return {
