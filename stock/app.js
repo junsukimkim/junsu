@@ -547,3 +547,109 @@ document.addEventListener("DOMContentLoaded", () => {
   // 최초 렌더
   renderAll();
 });
+
+// ===== DART 원클릭 가져오기 (app.js 맨 아래에 붙여넣기) =====
+(function attachDartImport() {
+  function $(id) { return document.getElementById(id); }
+
+  function norm(s) {
+    return (s || "").toString().replace(/\s+/g, "").trim();
+  }
+
+  function existsEvent(store, corp, s, e) {
+    const a = norm(corp);
+    return (store.events || []).some(ev =>
+      norm(ev.companyName) === a &&
+      String(ev.startDate) === String(s) &&
+      String(ev.endDate) === String(e)
+    );
+  }
+
+  async function importFromDart() {
+    const statusEl = $("import-status");
+    const yEl = $("dart-year");
+    const mEl = $("dart-month");
+
+    if (!statusEl || !yEl || !mEl) {
+      alert("import UI 요소를 못 찾았어요. index.html에 dart-year/dart-month/import-status가 있는지 확인!");
+      return;
+    }
+
+    const year = String(parseInt(yEl.value, 10) || new Date().getFullYear());
+    const month = String(parseInt(mEl.value, 10) || (new Date().getMonth() + 1));
+
+    statusEl.textContent = "불러오는 중…";
+
+    // ✅ 같은 도메인에서 Netlify Function 호출
+    const url = `/.netlify/functions/dart-ipo?year=${encodeURIComponent(year)}&month=${encodeURIComponent(month)}`;
+
+    let data;
+    try {
+      const res = await fetch(url, { cache: "no-store" });
+      // Netlify가 200으로 내려주는 경우가 많아서 status만 믿지 말고 JSON도 확인
+      data = await res.json();
+      if (!data || data.ok !== true) {
+        throw new Error(data?.error || `가져오기 실패 (HTTP ${res.status})`);
+      }
+    } catch (err) {
+      console.error(err);
+      statusEl.textContent = "";
+      alert("DART 가져오기 실패: " + (err?.message || err));
+      return;
+    }
+
+    // store가 전역에 없을 수도 있으니 최대한 안전하게 가져오기
+    // (너 기존 코드가 var store = ... 형태면 아래가 그대로 잡힘)
+    try {
+      if (typeof store === "undefined") {
+        alert("store 변수를 찾을 수 없어요. app.js에서 store 초기화가 먼저 되어야 해요.");
+        statusEl.textContent = "";
+        return;
+      }
+
+      if (!store.events) store.events = [];
+
+      let added = 0;
+      for (const it of (data.items || [])) {
+        const corp = it.corp_name;
+        const s = it.sbd_start;
+        const e = it.sbd_end;
+
+        if (!corp || !s || !e) continue;
+        if (existsEvent(store, corp, s, e)) continue; // 중복 방지
+
+        store.events.push({
+          id: (typeof uid === "function") ? uid() : ("id-" + Math.random().toString(16).slice(2)),
+          companyName: corp,
+          startDate: s,
+          endDate: e,
+          underwriters: "", // DART 달력엔 주간사 정보가 없어서 비워둠
+          memo: "DART 자동 가져오기",
+          starred: true, // 기본: 관심(⭐) 포함
+          perMember: {} // 가족 체크리스트용
+        });
+        added++;
+      }
+
+      if (typeof saveStore === "function") saveStore(store);
+      if (typeof renderAll === "function") renderAll();
+
+      statusEl.textContent = `완료! ${added}개 추가됨 (${year}-${String(month).padStart(2, "0")})`;
+    } catch (e) {
+      console.error(e);
+      statusEl.textContent = "";
+      alert("추가 처리 중 오류: " + (e?.message || e));
+    }
+  }
+
+  window.addEventListener("DOMContentLoaded", () => {
+    const btn = document.getElementById("import-dart");
+    if (!btn) return;
+
+    // 중복 바인딩 방지
+    if (btn.dataset.bound === "1") return;
+    btn.dataset.bound = "1";
+
+    btn.addEventListener("click", importFromDart);
+  });
+})();
